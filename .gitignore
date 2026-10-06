@@ -1,0 +1,9 @@
+/ext/haskell_match/target/
+/lib/haskell_match/native/*.so
+/lib/haskell_match/native/*.dylib
+/lib/haskell_match/native/*.dll
+/lib/haskell_match/native/*.bundle
+/ext/haskell_match/Makefile
+/pkg/
+/tmp/
+Gemfile.lock

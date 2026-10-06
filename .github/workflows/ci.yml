@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: Ruby ${{ matrix.ruby }} / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        ruby: ["3.2", "3.3"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: ${{ matrix.ruby }}
+          bundler-cache: true
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ext/haskell_match
+      - name: Rust format
+        run: cargo fmt --check
+        working-directory: ext/haskell_match
+      - name: Rust clippy
+        run: cargo clippy --all-targets -- -D warnings
+        working-directory: ext/haskell_match
+      - name: Rust unit tests
+        run: cargo test --lib
+        working-directory: ext/haskell_match
+      - name: Build extension and run Ruby tests
+        run: bundle exec rake test
