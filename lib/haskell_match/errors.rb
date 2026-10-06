@@ -8,7 +8,22 @@ module HaskellMatch
   class CompileError < Error; end
 
   # Malformed pattern text.
-  class PatternSyntaxError < CompileError; end
+  class PatternSyntaxError < CompileError
+    # Reformat the native "msg (column N in \"src\")" into a message that
+    # shows the pattern with a caret under the column.
+    def self.with_caret(message)
+      m = message.match(/\A(.*) \(column (\d+) in (".*")\)\z/m)
+      return message unless m
+
+      src = begin
+        eval(m[3]) # rubocop:disable Security/Eval -- a Rust-escaped string literal
+      rescue SyntaxError, StandardError
+        return message
+      end
+      col = m[2].to_i
+      "#{m[1]}\n    #{src}\n    #{' ' * [col - 1, 0].max}^"
+    end
+  end
 
   # A constructor name that no registered data type declares.
   class UnknownConstructorError < CompileError; end

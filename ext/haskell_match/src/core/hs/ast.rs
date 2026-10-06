@@ -142,6 +142,14 @@ fn render(p: &RawPat, atomic: bool) -> String {
                 .join(", ")
         ),
         RawPat::Cons(h, t) => format!("({}:{})", render(h, true), render(t, true)),
+        RawPat::Hash(fields) => format!(
+            "{{{}}}",
+            fields
+                .iter()
+                .map(|(k, p)| format!("{} = {}", k, render(p, false)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
         RawPat::Con(name, args) => {
             if args.is_empty() {
                 name.clone()
@@ -201,5 +209,6 @@ pub fn pat_vars(p: &RawPat, out: &mut Vec<String>) {
         }
         RawPat::Con(_, args) => args.iter().for_each(|a| pat_vars(a, out)),
         RawPat::Record(_, fields, _) => fields.iter().for_each(|(_, p)| pat_vars(p, out)),
+        RawPat::Hash(fields) => fields.iter().for_each(|(_, p)| pat_vars(p, out)),
     }
 }

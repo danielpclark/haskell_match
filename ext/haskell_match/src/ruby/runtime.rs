@@ -13,7 +13,7 @@ use rutie::{AnyObject, Object, VM};
 
 use std::collections::HashMap;
 
-use crate::core::ast::{Lit, LitKey, LitKind, Pat};
+use crate::core::ast::{HKey, Lit, LitKey, LitKind, Pat};
 use crate::core::tree::{BindSrc, LazyPat, Leaf, Tree};
 use crate::core::types::{TypeEnv, TypeId, TypeKind};
 
@@ -157,6 +157,15 @@ pub enum RtTree {
         cases: Vec<RtLitCase>,
         default: Box<RtTree>,
     },
+    TestHash {
+        slot: usize,
+        /// Pinned key objects (Symbols / frozen Strings), in `keys` order.
+        key_objs: Vec<Value>,
+        keys: Vec<HKey>,
+        base: usize,
+        then: Box<RtTree>,
+        otherwise: Box<RtTree>,
+    },
 }
 
 /// Why a match did not produce a clause.
@@ -198,6 +207,7 @@ pub fn lazy_literals(t: &Tree, out: &mut Vec<Lit>) {
             }
             Pat::As(_, p) | Pat::Lazy(p) => in_pat(p, out),
             Pat::Con(_, args) => args.iter().for_each(|a| in_pat(a, out)),
+            Pat::Hash(fields) => fields.iter().for_each(|(_, a)| in_pat(a, out)),
             Pat::Wild | Pat::Var(_) => {}
         }
     }
@@ -221,7 +231,25 @@ pub fn lazy_literals(t: &Tree, out: &mut Vec<Lit>) {
             cases.iter().for_each(|(_, t)| lazy_literals(t, out));
             lazy_literals(default, out);
         }
+        Tree::TestHash {
+            then, otherwise, ..
+        } => {
+            lazy_literals(then, out);
+            lazy_literals(otherwise, out);
+        }
     }
+}
+
+/// The Ruby object for a Hash pattern key, pinned for the process lifetime.
+pub fn key_object(k: &HKey) -> Value {
+    let v = match k {
+        HKey::Sym(s) => rutie::Symbol::new(s).value(),
+        HKey::Str(s) => unsafe {
+            rutie::rubysys::string::rb_str_freeze(rutie::RString::new_utf8(s).value())
+        },
+    };
+    unsafe { rutie::rubysys::gc::rb_gc_register_mark_object(v) };
+    v
 }
 
 pub fn literal_object(l: &Lit) -> Value {
@@ -287,6 +315,42 @@ pub fn translate(env: &TypeEnv, t: &Tree) -> RtTree {
                 .collect(),
             default: Box::new(translate(env, default)),
         },
+        Tree::TestHash {
+            slot,
+            keys,
+            base,
+            then,
+            otherwise,
+        } => RtTree::TestHash {
+            slot: *slot,
+            key_objs: keys.iter().map(key_object).collect(),
+            keys: keys.clone(),
+            base: *base,
+            then: Box::new(translate(env, then)),
+            otherwise: Box::new(translate(env, otherwise)),
+        },
+    }
+}
+
+#[inline]
+fn is_hash(v: Value) -> bool {
+    v.ty() == ValueType::Hash
+}
+
+#[inline]
+fn qundef() -> Value {
+    Value::from(rutie::rubysys::value::RubySpecialConsts::Undef as usize)
+}
+
+/// The value at `key`, or `None` when the Hash has no such key (a key whose
+/// value is `nil` is present).
+#[inline]
+unsafe fn hash_fetch(h: Value, key: Value) -> Option<Value> {
+    let v = rutie::rubysys::hash::rb_hash_lookup2(h, key, qundef());
+    if v.value == qundef().value {
+        None
+    } else {
+        Some(v)
     }
 }
 
@@ -380,6 +444,7 @@ unsafe fn identify(env: &TypeEnv, ty: TypeId, slot: Slot) -> Result<Option<usize
 unsafe fn fields_into(
     env: &TypeEnv,
     ty: TypeId,
+    tag: usize,
     slot: Slot,
     arity: usize,
     base: usize,
@@ -387,9 +452,29 @@ unsafe fn fields_into(
 ) -> Result<(), RtError> {
     match env.ty(ty).kind {
         TypeKind::Adt => {
-            for i in 0..arity {
-                let idx = rutie::Integer::new(i as i64).value();
-                slots[base + i] = Slot::plain(rstruct::rb_struct_aref(slot.v, idx));
+            if slot.v.ty() == ValueType::Struct {
+                // `Data` and `Struct` instances: fields by position
+                for i in 0..arity {
+                    let idx = rutie::Integer::new(i as i64).value();
+                    slots[base + i] = Slot::plain(rstruct::rb_struct_aref(slot.v, idx));
+                }
+            } else {
+                // any other class (a sealed hierarchy): fields are reader methods
+                let con = env.con(env.con_by_tag(ty, tag));
+                let names = con.fields.as_ref().ok_or_else(|| RtError::TypeMismatch {
+                    expected: format!("{} with field readers", con.name),
+                    got: slot.v,
+                })?;
+                for (i, name) in names.iter().enumerate().take(arity) {
+                    let cname =
+                        std::ffi::CString::new(name.as_str()).expect("field names have no NUL");
+                    let id = rutie::rubysys::symbol::rb_intern(cname.as_ptr());
+                    let v = call_protected(|| {
+                        rutie::rubysys::vm::rb_funcallv(slot.v, id, 0, std::ptr::null())
+                    })
+                    .map_err(RtError::Ruby)?;
+                    slots[base + i] = Slot::plain(v);
+                }
             }
         }
         TypeKind::Bool => {}
@@ -658,7 +743,7 @@ impl Matcher {
                     match identify(&self.env, *ty, s)? {
                         Some(tag) => match cases.iter().find(|c| c.tag == tag) {
                             Some(c) => {
-                                fields_into(&self.env, *ty, s, c.arity, c.base, slots)?;
+                                fields_into(&self.env, *ty, c.tag, s, c.arity, c.base, slots)?;
                                 node = &c.tree;
                             }
                             None => match default {
@@ -702,6 +787,37 @@ impl Matcher {
                         }
                     }
                     node = next;
+                }
+                RtTree::TestHash {
+                    slot,
+                    key_objs,
+                    base,
+                    then,
+                    otherwise,
+                    ..
+                } => {
+                    let s = slots[*slot];
+                    if s.kind != SlotKind::Plain || !is_hash(s.v) {
+                        if matches!(**otherwise, RtTree::Fail) {
+                            return Err(RtError::TypeMismatch {
+                                expected: "Hash".to_string(),
+                                got: materialize(s),
+                            });
+                        }
+                        node = otherwise;
+                        continue;
+                    }
+                    let mut all = true;
+                    for (i, k) in key_objs.iter().enumerate() {
+                        match hash_fetch(s.v, *k) {
+                            Some(v) => slots[*base + i] = Slot::plain(v),
+                            None => {
+                                all = false;
+                                break;
+                            }
+                        }
+                    }
+                    node = if all { then } else { otherwise };
                 }
             }
         }
@@ -791,13 +907,26 @@ impl Matcher {
                 };
                 lit_matches(kind, &case, slot)
             }
+            Pat::Hash(fields) => {
+                if slot.kind != SlotKind::Plain || !is_hash(slot.v) {
+                    return false;
+                }
+                fields
+                    .iter()
+                    .all(|(k, p)| match hash_fetch(slot.v, key_object(k)) {
+                        Some(v) => self.destructure(p, Slot::plain(v), store),
+                        None => false,
+                    })
+            }
             Pat::Con(c, args) => {
                 let con = self.env.con(*c);
                 let ty = con.ty;
                 match identify(&self.env, ty, slot) {
                     Ok(Some(tag)) if tag == con.tag => {
                         let mut tmp = vec![Slot::empty(); con.arity];
-                        if fields_into(&self.env, ty, slot, con.arity, 0, &mut tmp).is_err() {
+                        if fields_into(&self.env, ty, con.tag, slot, con.arity, 0, &mut tmp)
+                            .is_err()
+                        {
                             return false;
                         }
                         args.iter()
@@ -870,6 +999,29 @@ pub fn dump(env: &TypeEnv, t: &RtTree, names: &[Vec<String>], indent: usize) -> 
             }
             s.push_str(&format!("{}  _:\n", pad));
             s.push_str(&dump(env, default, names, indent + 2));
+            s
+        }
+        RtTree::TestHash {
+            slot,
+            keys,
+            base,
+            then,
+            otherwise,
+            ..
+        } => {
+            let shown: Vec<String> = keys.iter().map(|k| k.to_string()).collect();
+            let slots: Vec<String> = (0..keys.len()).map(|i| format!("{}", base + i)).collect();
+            let mut s = format!(
+                "{}hash slot {} has keys {{{}}} -> slots [{}]\n",
+                pad,
+                slot,
+                shown.join(", "),
+                slots.join(", ")
+            );
+            s.push_str(&format!("{}  yes:\n", pad));
+            s.push_str(&dump(env, then, names, indent + 2));
+            s.push_str(&format!("{}  no:\n", pad));
+            s.push_str(&dump(env, otherwise, names, indent + 2));
             s
         }
     }

@@ -45,7 +45,8 @@ class SyntaxTest < Minitest::Test
 
   def test_syntax_error_messages_point_at_the_problem
     err = assert_raises(HaskellMatch::PatternSyntaxError) { fn { on("Just (x") { 1 } } }
-    assert_match(/expected '\)'.*column \d+ in "Just \(x"/, err.message)
+    assert_equal ["clause 1: expected ')' but reached end of pattern", "    Just (x", "          ^"],
+                 err.message.lines.map(&:chomp)
     err = assert_raises(HaskellMatch::PatternSyntaxError) { fn { on("a b") { 1 } } }
     assert_includes err.message, "unexpected variable 'b' after pattern"
     err = assert_raises(HaskellMatch::PatternSyntaxError) { fn { on("x $ y") { 1 } } }

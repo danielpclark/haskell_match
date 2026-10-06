@@ -1,6 +1,6 @@
 //! Haskell-style rendering of patterns, used for diagnostics.
 
-use super::ast::{Lit, Pat};
+use super::ast::{HKey, Lit, Pat};
 use super::types::{TypeEnv, TypeKind, CON_CONS, CON_NIL};
 
 /// A witness pattern produced by the exhaustiveness checker.
@@ -12,6 +12,11 @@ pub enum WPat {
     NotLit(Vec<Lit>),
     Lit(Lit),
     Con(super::types::ConId, Vec<WPat>),
+    /// A Hash with these keys (and any others).
+    Hash(Vec<(HKey, WPat)>),
+    /// A Hash lacking a key from each of the listed key sets: the Hash
+    /// patterns with those keys are handled, any other Hash is not.
+    NoKeys(Vec<Vec<HKey>>),
 }
 
 impl WPat {
@@ -21,7 +26,22 @@ impl WPat {
             Pat::As(_, p) => WPat::from_pat(p),
             Pat::Lit(l) => WPat::Lit(l.clone()),
             Pat::Con(c, args) => WPat::Con(*c, args.iter().map(WPat::from_pat).collect()),
+            Pat::Hash(fields) => WPat::Hash(
+                fields
+                    .iter()
+                    .map(|(k, p)| (k.clone(), WPat::from_pat(p)))
+                    .collect(),
+            ),
         }
+    }
+}
+
+fn render_keys(keys: &[HKey]) -> String {
+    let shown: Vec<String> = keys.iter().map(|k| k.to_string()).collect();
+    if keys.len() == 1 {
+        format!("the key {}", shown[0])
+    } else {
+        format!("the keys {{{}}}", shown.join(", "))
     }
 }
 
@@ -52,6 +72,22 @@ fn render(env: &TypeEnv, p: &WPat, atomic: bool, notes: &mut Vec<String>) -> Str
             let name = format!("p{}", notes.len() + 1);
             let shown: Vec<String> = lits.iter().map(|l| l.to_string()).collect();
             notes.push(format!("{} is not one of {{{}}}", name, shown.join(", ")));
+            name
+        }
+        WPat::Hash(fields) => {
+            let inner: Vec<String> = fields
+                .iter()
+                .map(|(k, p)| format!("{} = {}", k, render(env, p, false, notes)))
+                .collect();
+            format!("{{{}}}", inner.join(", "))
+        }
+        WPat::NoKeys(sets) => {
+            let name = format!("p{}", notes.len() + 1);
+            let parts: Vec<String> = sets
+                .iter()
+                .map(|k| format!("without {}", render_keys(k)))
+                .collect();
+            notes.push(format!("{} is a Hash {}", name, parts.join(" or ")));
             name
         }
         WPat::Con(c, args) => {
@@ -149,6 +185,13 @@ fn render_pat_inner(env: &TypeEnv, p: &Pat, names: &[String], atomic: bool) -> S
         ),
         Pat::Lazy(inner) => format!("~{}", render_pat_inner(env, inner, names, true)),
         Pat::Lit(l) => render_lit(l, atomic),
+        Pat::Hash(fields) => {
+            let inner: Vec<String> = fields
+                .iter()
+                .map(|(k, p)| format!("{} = {}", k, render_pat_inner(env, p, names, false)))
+                .collect();
+            format!("{{{}}}", inner.join(", "))
+        }
         Pat::Con(c, args) => {
             let con = env.con(*c);
             match env.ty(con.ty).kind {

@@ -26,6 +26,8 @@ HaskellMatch::NativeLoader.load!
 
 require_relative "haskell_match/inspect"
 require_relative "haskell_match/data"
+require_relative "haskell_match/deriving"
+require_relative "haskell_match/field_types"
 require_relative "haskell_match/lazy_list"
 require_relative "haskell_match/pattern_ast"
 require_relative "haskell_match/binding_plan"

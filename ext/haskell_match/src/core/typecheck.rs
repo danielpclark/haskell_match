@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 
-use super::ast::{LitKind, Pat};
+use super::ast::{HKey, LitKind, Pat};
 use super::error::{CoreError, ErrorKind, Result};
 use super::types::{ConId, TypeEnv, TypeId};
 
@@ -16,28 +16,42 @@ use super::types::{ConId, TypeEnv, TypeId};
 pub enum ColType {
     Con(TypeId),
     Lit(LitKind),
+    Hash,
 }
 
 fn describe(env: &TypeEnv, t: ColType) -> String {
     match t {
         ColType::Con(ty) => env.ty(ty).name.clone(),
         ColType::Lit(k) => k.name().to_string(),
+        ColType::Hash => "Hash".to_string(),
     }
 }
 
+/// One step into a sub-pattern: a constructor field or a Hash key.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum Step {
+    Field(ConId, usize),
+    Key(HKey),
+}
+
 /// Position of a sub-pattern: the argument index followed by the chain of
-/// (constructor, field index) steps taken to reach it.
-type Path = (usize, Vec<(ConId, usize)>);
+/// steps taken to reach it.
+type Path = (usize, Vec<Step>);
 
 fn describe_path(env: &TypeEnv, path: &Path) -> String {
     let mut s = format!("argument {}", path.0 + 1);
-    for (con, field) in &path.1 {
-        let c = env.con(*con);
-        let fname = match &c.fields {
-            Some(fs) => format!("field '{}'", fs[*field]),
-            None => format!("field {}", field + 1),
-        };
-        s.push_str(&format!(", {} of '{}'", fname, c.name));
+    for step in &path.1 {
+        match step {
+            Step::Field(con, field) => {
+                let c = env.con(*con);
+                let fname = match &c.fields {
+                    Some(fs) => format!("field '{}'", fs[*field]),
+                    None => format!("field {}", field + 1),
+                };
+                s.push_str(&format!(", {} of '{}'", fname, c.name));
+            }
+            Step::Key(k) => s.push_str(&format!(", key {} of the Hash", k)),
+        }
     }
     s
 }
@@ -68,7 +82,17 @@ fn walk(
         Pat::Con(c, args) => {
             unify(env, path, ColType::Con(env.type_of_con(*c)), clause, seen)?;
             for (i, a) in args.iter().enumerate() {
-                path.1.push((*c, i));
+                path.1.push(Step::Field(*c, i));
+                let r = walk(env, a, path, clause, seen);
+                path.1.pop();
+                r?;
+            }
+            Ok(())
+        }
+        Pat::Hash(fields) => {
+            unify(env, path, ColType::Hash, clause, seen)?;
+            for (k, a) in fields {
+                path.1.push(Step::Key(k.clone()));
                 let r = walk(env, a, path, clause, seen);
                 path.1.pop();
                 r?;

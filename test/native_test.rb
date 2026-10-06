@@ -10,8 +10,10 @@ class NativeTest < Minitest::Test
   N = HaskellMatch::Native
 
   def test_parse_data
-    assert_equal ["Maybe", ["a"], [["Nothing", 0, nil], ["Just", 1, nil]]], N.parse_data("Maybe a = Nothing | Just a")
-    assert_equal [["P", 2, %w[a b]]], N.parse_data("P = P { a :: Int, b :: Int }")[2]
+    assert_equal ["Maybe", ["a"], [["Nothing", 0, nil, []], ["Just", 1, nil, ["a"]]], []],
+                 N.parse_data("Maybe a = Nothing | Just a")
+    assert_equal [["P", 2, %w[a b], %w[Int Int]]], N.parse_data("P = P { a :: Int, b :: Int }")[2]
+    assert_equal %w[Eq Ord], N.parse_data("P = P Int deriving (Eq, Ord)")[3]
     assert_raises(HaskellMatch::DataDeclarationError) { N.parse_data("= X") }
     assert_raises(ArgumentError) { N.parse_data(5) }
   end

@@ -36,9 +36,10 @@ module HaskellMatch
              scope: Native::GLOBAL_SCOPE, &definition)
       raise ArgumentError, "hdef needs a block with on(...) clauses" unless definition
 
-      clauses = ClauseBuilder.collect(definition).clauses
+      builder = ClauseBuilder.collect(definition)
+      clauses = builder.clauses
       matcher, _bodies, _guards = Compiler.compile(name, clauses, exhaustive: exhaustive, overlapping: overlapping,
-                                                                   scope: scope)
+                                                                   scope: scope, resolver: builder.constant_resolver)
       names = matcher.names
       guards = clauses.map { |c| c.guard.equal?(ClauseBuilder::OTHERWISE) ? nil : c.guard }
       plans = clauses.each_with_index.map do |c, i|

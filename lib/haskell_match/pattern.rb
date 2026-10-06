@@ -20,7 +20,9 @@ module HaskellMatch
 
       @source = source.dup.freeze
       @scope = scope
-      @matcher = Native::Matcher.new("pattern #{source.inspect}", [[source]], [false], 1, scope)
+      resolver = block && ClauseBuilder.new(block.binding.receiver).constant_resolver
+      @matcher = Compiler.build_matcher(Native::Matcher, "pattern #{source.inspect}", [[source]], [false], 1, scope,
+                                        resolver: resolver)
       @names = @matcher.names.first.map(&:to_sym).freeze
       @exhaustive = @matcher.instance_variable_get(:@missing).empty?
       freeze

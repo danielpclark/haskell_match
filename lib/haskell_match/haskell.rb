@@ -99,8 +99,21 @@ module HaskellMatch
       def parse(source, file = "(haskell)", line_offset = 0)
         JSON.parse(Native.parse_haskell(source))
       rescue CompileError => e
-        msg = e.message.sub(/\A(\d+):/) { "#{Regexp.last_match(1).to_i + line_offset}:" }
-        raise HaskellSyntaxError, "#{file}:#{msg}"
+        raise HaskellSyntaxError, located(e.message, source, file, line_offset)
+      end
+
+      # "line:col: message" -> "file:line:col: message" plus the source line
+      # and a caret under the column.
+      def located(message, source, file, line_offset)
+        m = message.match(/\A(\d+):(\d+): (.*)\z/m)
+        return "#{file}:#{message}" unless m
+
+        line, col, text = m[1].to_i, m[2].to_i, m[3]
+        src_line = source.lines[line - 1]&.chomp
+        shown = "#{file}:#{line + line_offset}:#{col}: #{text}"
+        return shown if src_line.nil?
+
+        "#{shown}\n  #{src_line}\n  #{' ' * [col - 1, 0].max}^"
       end
 
       # [path, line] of the Ruby call site, for default error locations.

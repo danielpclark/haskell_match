@@ -23,13 +23,15 @@ module HaskellMatch
       raise ArgumentError, "case_of needs a block with on(...) clauses" unless definition
       raise ArgumentError, "case_of needs at least one value" if values.empty?
 
-      clauses = ClauseBuilder.collect(definition).clauses
+      builder = ClauseBuilder.collect(definition)
+      clauses = builder.clauses
       key = [scope, cache_key(clauses, exhaustive, overlapping)]
       entry = LOCK.synchronize { CACHE[key] }
       unless entry
         name = "case expression at #{definition.source_location&.join(':')}"
         matcher, _bodies, _guards = Compiler.compile(name, clauses, exhaustive: exhaustive, overlapping: overlapping,
-                                                                     kind: "case expression", scope: scope)
+                                                                     kind: "case expression", scope: scope,
+                                                                     resolver: builder.constant_resolver)
         entry = [matcher, matcher.names]
         LOCK.synchronize do
           CACHE.clear if CACHE.size >= MAX_CACHE

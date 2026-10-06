@@ -11,7 +11,7 @@
 //! when computing what later clauses or the whole function cover, exactly
 //! as GHC treats guards other than `otherwise`.
 
-use super::ast::{Lit, LitKey, Pat};
+use super::ast::{HKey, Lit, LitKey, Pat};
 use super::pretty::WPat;
 use super::types::{ConId, TypeEnv, TypeId};
 
@@ -32,12 +32,27 @@ enum Heads {
     None,
     Cons(TypeId, Vec<ConId>),
     Lits(Vec<Lit>),
+    /// The distinct key sets of the Hash patterns in the column.
+    Hashes(Vec<Vec<HKey>>),
+}
+
+fn key_set(fields: &[(HKey, Pat)]) -> Vec<HKey> {
+    fields.iter().map(|(k, _)| k.clone()).collect()
+}
+
+fn same_keys(a: &[HKey], b: &[HKey]) -> bool {
+    a.len() == b.len() && a.iter().all(|k| b.contains(k))
+}
+
+fn subset(a: &[HKey], b: &[HKey]) -> bool {
+    a.iter().all(|k| b.contains(k))
 }
 
 fn heads(env: &TypeEnv, m: &Matrix) -> Heads {
     let mut cons: Vec<ConId> = Vec::new();
     let mut lits: Vec<Lit> = Vec::new();
     let mut keys: Vec<LitKey> = Vec::new();
+    let mut hashes: Vec<Vec<HKey>> = Vec::new();
     let mut ty = None;
     let mut kind = None;
     for row in m {
@@ -56,14 +71,65 @@ fn heads(env: &TypeEnv, m: &Matrix) -> Heads {
                     lits.push(l.clone());
                 }
             }
+            Pat::Hash(fields) => {
+                let ks = key_set(fields);
+                if !hashes.iter().any(|h| same_keys(h, &ks)) {
+                    hashes.push(ks);
+                }
+            }
             _ => {}
         }
     }
     match (ty, kind) {
         (Some(t), _) => Heads::Cons(t, cons),
         (None, Some(_)) => Heads::Lits(lits),
+        (None, None) if !hashes.is_empty() => Heads::Hashes(hashes),
         (None, None) => Heads::None,
     }
+}
+
+/// S({K}, P): rows that can match a Hash having exactly the keys `keys`,
+/// with the value at each key expanded into its own column.  A Hash row
+/// whose keys are a subset of `keys` matches (its missing keys become `_`);
+/// one needing a key outside `keys` cannot.
+fn specialize_hash(m: &Matrix, keys: &[HKey]) -> Matrix {
+    let mut out = Vec::new();
+    for row in m {
+        match &row[0] {
+            Pat::Hash(fields) if subset(&key_set(fields), keys) => {
+                let mut r: Row = keys
+                    .iter()
+                    .map(|k| {
+                        fields
+                            .iter()
+                            .find(|(kk, _)| kk == k)
+                            .map(|(_, p)| p.clone())
+                            .unwrap_or(Pat::Wild)
+                    })
+                    .collect();
+                r.extend_from_slice(&row[1..]);
+                out.push(r);
+            }
+            Pat::Wild => {
+                let mut r: Row = wilds(keys.len()).collect();
+                r.extend_from_slice(&row[1..]);
+                out.push(r);
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// D(P) for a Hash column: wildcard rows plus `{}` rows, which match every
+/// Hash.
+fn default_hash(m: &Matrix) -> Matrix {
+    m.iter()
+        .filter(|row| {
+            matches!(&row[0], Pat::Wild) || matches!(&row[0], Pat::Hash(f) if f.is_empty())
+        })
+        .map(|row| row[1..].to_vec())
+        .collect()
 }
 
 fn wilds(n: usize) -> impl Iterator<Item = Pat> {
@@ -127,12 +193,20 @@ pub fn useful(env: &TypeEnv, m: &Matrix, q: &[Pat]) -> bool {
             useful(env, &specialize_con(env, m, *c), &nq)
         }
         Pat::Lit(l) => useful(env, &specialize_lit(m, l), &q[1..]),
+        Pat::Hash(fields) => {
+            let keys = key_set(fields);
+            let mut nq: Vec<Pat> = fields.iter().map(|(_, p)| p.clone()).collect();
+            nq.extend_from_slice(&q[1..]);
+            useful(env, &specialize_hash(m, &keys), &nq)
+        }
         _ => match heads(env, m) {
             Heads::Cons(ty, cs) if env.is_complete(ty, &cs) => cs.iter().any(|c| {
                 let mut nq: Vec<Pat> = wilds(env.con(*c).arity).collect();
                 nq.extend_from_slice(&q[1..]);
                 useful(env, &specialize_con(env, m, *c), &nq)
             }),
+            // a Hash lacking a key of every Hash pattern escapes them all
+            Heads::Hashes(_) => useful(env, &default_hash(m), &q[1..]),
             _ => useful(env, &default(m), &q[1..]),
         },
     }
@@ -214,6 +288,36 @@ impl<'a> Collector<'a> {
                     let mut row = vec![WPat::NotLit(lits.clone())];
                     row.extend_from_slice(&w);
                     out.push(row);
+                }
+            }
+            Heads::Hashes(sets) => {
+                'sets: for keys in &sets {
+                    let sub = self.missing(&specialize_hash(m, keys), keys.len() + n - 1);
+                    for w in sub {
+                        if out.len() >= self.limit {
+                            self.truncated = true;
+                            break 'sets;
+                        }
+                        let (vals, rest) = w.split_at(keys.len());
+                        let fields = keys.iter().cloned().zip(vals.iter().cloned()).collect();
+                        let mut row = vec![WPat::Hash(fields)];
+                        row.extend_from_slice(rest);
+                        out.push(row);
+                    }
+                }
+                // `{}` matches every Hash, so with it present the default
+                // case was already covered by the empty key set above
+                if !sets.iter().any(|k| k.is_empty()) {
+                    let sub = self.missing(&default_hash(m), n - 1);
+                    for w in sub {
+                        if out.len() >= self.limit {
+                            self.truncated = true;
+                            break;
+                        }
+                        let mut row = vec![WPat::NoKeys(sets.clone())];
+                        row.extend_from_slice(&w);
+                        out.push(row);
+                    }
                 }
             }
             Heads::None => {
@@ -522,6 +626,56 @@ mod tests {
             )
             .1,
             vec![3]
+        );
+    }
+
+    #[test]
+    fn hash_patterns() {
+        let mut env = env();
+        let empty: Vec<String> = vec![];
+        // a wildcard (or `{}`) is needed to cover every Hash
+        assert_eq!(
+            run(&mut env, &[&["{name = n}"], &["_"]]),
+            (empty.clone(), vec![], false)
+        );
+        assert_eq!(
+            run(&mut env, &[&["{name = n}"], &["{}"]]),
+            (empty.clone(), vec![], false)
+        );
+        assert_eq!(
+            run(&mut env, &[&["{name = n}"]]).0,
+            vec!["p1 where p1 is a Hash without the key name"]
+        );
+        assert_eq!(
+            run(&mut env, &[&["{a = 1}"], &["{b = _}"]]).0,
+            vec![
+                "{a = p1} where p1 is not one of {1}",
+                "p1 where p1 is a Hash without the key a or without the key b"
+            ]
+        );
+        // nested exhaustiveness inside a key
+        assert_eq!(
+            run(&mut env, &[&["{m = Just x}"], &["_"]]),
+            (empty.clone(), vec![], false)
+        );
+        assert_eq!(
+            run(&mut env, &[&["{m = Just x}"], &["{m = Nothing}"], &["{}"]]),
+            (empty, vec![], false)
+        );
+        // redundancy: a superset of keys after a subset is unreachable
+        assert_eq!(
+            run(&mut env, &[&["{a = _}"], &["{a = _, b = _}"]]).1,
+            vec![1]
+        );
+        assert_eq!(run(&mut env, &[&["{}"], &["{a = _}"]]).1, vec![1]);
+        // but a different key set is not
+        assert_eq!(
+            run(&mut env, &[&["{a = _}"], &["{b = _}"]]).1,
+            Vec::<usize>::new()
+        );
+        assert_eq!(
+            run(&mut env, &[&["{a = 0}"], &["{a = _}"]]).1,
+            Vec::<usize>::new()
         );
     }
 

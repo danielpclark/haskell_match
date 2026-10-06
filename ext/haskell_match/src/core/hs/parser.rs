@@ -347,7 +347,12 @@ impl P {
             }
         }
         Ok(Decl::Data {
-            decl: DataDecl { name, tyvars, cons },
+            decl: DataDecl {
+                name,
+                tyvars,
+                cons,
+                deriving: deriving.clone(),
+            },
             deriving,
             line,
         })
@@ -372,6 +377,7 @@ impl P {
                     name,
                     arity: 0,
                     fields: Some(fields),
+                    types: Vec::new(),
                 });
             }
             loop {
@@ -410,6 +416,7 @@ impl P {
                 name,
                 arity,
                 fields: Some(fields),
+                types: Vec::new(),
             });
         }
         let mut arity = 0;
@@ -421,6 +428,7 @@ impl P {
             name,
             arity,
             fields: None,
+            types: Vec::new(),
         })
     }
 

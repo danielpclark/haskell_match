@@ -6,7 +6,7 @@
 //! each bound variable by slot.  Each argument position is inspected at most
 //! once per path through the tree.
 
-use super::ast::{Lit, LitKind, Pat, VarId};
+use super::ast::{HKey, Lit, LitKind, Pat, VarId};
 use super::types::{ConId, TypeEnv, TypeId};
 
 #[derive(Clone, Debug, PartialEq)]
@@ -31,6 +31,16 @@ pub enum Tree {
         kind: LitKind,
         cases: Vec<(Lit, Tree)>,
         default: Box<Tree>,
+    },
+    /// Does the Hash in `slot` have every key in `keys`?  If so their values
+    /// go to slots `base..base+keys.len()` and matching continues with
+    /// `then`; otherwise (or for a non-Hash) with `otherwise`.
+    TestHash {
+        slot: usize,
+        keys: Vec<HKey>,
+        base: usize,
+        then: Box<Tree>,
+        otherwise: Box<Tree>,
     },
 }
 
@@ -133,7 +143,16 @@ fn vars_in(p: &Pat, out: &mut Vec<VarId>) {
         }
         Pat::Lazy(inner) => vars_in(inner, out),
         Pat::Con(_, args) => args.iter().for_each(|a| vars_in(a, out)),
+        Pat::Hash(fields) => fields.iter().for_each(|(_, a)| vars_in(a, out)),
     }
+}
+
+fn hash_keys(fields: &[(HKey, Pat)]) -> Vec<HKey> {
+    fields.iter().map(|(k, _)| k.clone()).collect()
+}
+
+fn key_subset(a: &[HKey], b: &[HKey]) -> bool {
+    a.iter().all(|k| b.contains(k))
 }
 
 /// Strip binders from every column so each pattern is `Wild`, `Con` or
@@ -307,7 +326,64 @@ impl<'a> Compiler<'a> {
                     default,
                 }
             }
-            _ => unreachable!("normalized rows contain only Wild, Con and Lit"),
+            Pat::Hash(f0) => {
+                // Hash patterns overlap (a value may have the keys of several),
+                // so they are tested one key set at a time, in clause order.
+                let keys = hash_keys(f0);
+                let n = keys.len();
+                let base = self.alloc(n);
+                let mut then_occs: Vec<usize> = occs[..col].to_vec();
+                then_occs.extend(base..base + n);
+                then_occs.extend_from_slice(&occs[col + 1..]);
+                let mut then_rows = Vec::new();
+                let mut else_rows = Vec::new();
+                for r in &rows {
+                    match &r.pats[col] {
+                        Pat::Hash(f) => {
+                            let ks = hash_keys(f);
+                            if key_subset(&ks, &keys) {
+                                // has every key the row needs: its sub-patterns
+                                // take the key columns, unmentioned keys are `_`
+                                let mut nr = r.clone();
+                                nr.pats = r.pats[..col].to_vec();
+                                for k in &keys {
+                                    nr.pats.push(
+                                        f.iter()
+                                            .find(|(kk, _)| kk == k)
+                                            .map(|(_, p)| p.clone())
+                                            .unwrap_or(Pat::Wild),
+                                    );
+                                }
+                                nr.pats.extend_from_slice(&r.pats[col + 1..]);
+                                normalize(&mut nr, &then_occs);
+                                then_rows.push(nr);
+                            }
+                            // a value lacking one of `keys` cannot match a row
+                            // needing all of them; any other row may still match
+                            if !key_subset(&keys, &ks) {
+                                else_rows.push(r.clone());
+                            }
+                        }
+                        Pat::Wild => {
+                            let mut nr = r.clone();
+                            nr.pats = r.pats[..col].to_vec();
+                            nr.pats.extend(std::iter::repeat_n(Pat::Wild, n));
+                            nr.pats.extend_from_slice(&r.pats[col + 1..]);
+                            then_rows.push(nr);
+                            else_rows.push(r.clone());
+                        }
+                        _ => {}
+                    }
+                }
+                Tree::TestHash {
+                    slot,
+                    keys,
+                    base,
+                    then: Box::new(self.compile(&then_occs, then_rows)),
+                    otherwise: Box::new(self.compile(occs, else_rows)),
+                }
+            }
+            _ => unreachable!("normalized rows contain only Wild, Con, Lit and Hash"),
         }
     }
 
@@ -342,6 +418,7 @@ pub mod interp {
         Bool(bool),
         Int(i64),
         Str(String),
+        Hash(Vec<(HKey, Val)>),
         Other(String),
     }
 
@@ -407,6 +484,16 @@ pub mod interp {
             }
             Pat::Lazy(p) => destructure(env, p, v, out),
             Pat::Lit(l) => lit_eq(l, v),
+            Pat::Hash(fields) => match v {
+                Val::Hash(entries) => fields.iter().all(|(k, p)| {
+                    entries
+                        .iter()
+                        .find(|(kk, _)| kk == k)
+                        .map(|(_, val)| destructure(env, p, val, out))
+                        .unwrap_or(false)
+                }),
+                _ => false,
+            },
             Pat::Con(c, args) => {
                 let ty = env.type_of_con(*c);
                 let _ = (CON_CONS, CON_NIL, CON_TRUE, CON_FALSE);
@@ -482,6 +569,36 @@ pub mod interp {
                         Some((_, t)) => node = t,
                         None => node = default,
                     }
+                }
+                Tree::TestHash {
+                    slot,
+                    keys,
+                    base,
+                    then,
+                    otherwise,
+                } => {
+                    let v = slots[*slot].clone().unwrap();
+                    let entries = match &v {
+                        Val::Hash(e) => e,
+                        _ => {
+                            if matches!(**otherwise, Tree::Fail) {
+                                return Outcome::TypeMismatch(usize::MAX - 1);
+                            }
+                            node = otherwise;
+                            continue;
+                        }
+                    };
+                    let mut all = true;
+                    for (i, k) in keys.iter().enumerate() {
+                        match entries.iter().find(|(kk, _)| kk == k) {
+                            Some((_, val)) => slots[*base + i] = Some(val.clone()),
+                            None => {
+                                all = false;
+                                break;
+                            }
+                        }
+                    }
+                    node = if all { then } else { otherwise };
                 }
             }
         }

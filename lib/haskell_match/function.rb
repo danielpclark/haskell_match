@@ -53,9 +53,11 @@ module HaskellMatch
                     scope: Native::GLOBAL_SCOPE)
       clauses = builder.clauses
       clauses = make_shareable(clauses) if ractor
-      f, bodies, guards = Compiler.compile(name.to_s, clauses, exhaustive: exhaustive,
-                                                             overlapping: overlapping, klass: self, scope: scope)
+      resolver = builder.respond_to?(:constant_resolver) ? builder.constant_resolver : nil
+      f, bodies, guards = Compiler.compile(name.to_s, clauses, exhaustive: exhaustive, overlapping: overlapping,
+                                                             klass: self, scope: scope, resolver: resolver)
       f.instance_variable_set(:@scope, scope)
+      f.instance_variable_set(:@helpers, builder.helpers.freeze)
       f.extend(DeepCall.module_for(f.arity)) if deep
       f.send(:attach, clauses, bodies, guards)
       builder.define_function(f, name.to_s)
@@ -105,6 +107,16 @@ module HaskellMatch
       to_proc.curry(arity)
     end
 
+    # Composition, as for Procs: `(f >> g).(x)` is `g.(f.(x))` and
+    # `(f << g).(x)` is `f.(g.(x))` (Haskell's `g . f` and `f . g`).
+    def >>(other)
+      to_proc >> other
+    end
+
+    def <<(other)
+      to_proc << other
+    end
+
     # The function as a curried Proc (memoised); what Haskell code receives
     # when it passes a function as a value.
     def curried
@@ -119,6 +131,16 @@ module HaskellMatch
     # Variables bound by each clause, in order.
     def bindings
       names
+    end
+
+    # The `where` helper functions defined inside this function, by name.
+    def helpers
+      @helpers || {}
+    end
+
+    # The type scope the patterns were compiled in.
+    def scope
+      @scope || Native::GLOBAL_SCOPE
     end
 
     # Human-readable dump of the compiled decision tree.
@@ -208,7 +230,8 @@ module HaskellMatch
            deep: deep_by_default, scope: Native::GLOBAL_SCOPE, &definition)
       raise ArgumentError, "HaskellMatch.fn needs a block with on(...) clauses" unless definition
 
-      builder = ClauseBuilder.collect(definition, ractor: ractor)
+      options = { exhaustive: exhaustive, overlapping: overlapping, deep: deep, scope: scope }
+      builder = ClauseBuilder.collect(definition, ractor: ractor, options: options)
       name ||= "anonymous function at #{definition.source_location&.join(':')}"
       Function.define(name, builder, exhaustive: exhaustive, overlapping: overlapping, ractor: ractor, deep: deep,
                                      scope: scope)

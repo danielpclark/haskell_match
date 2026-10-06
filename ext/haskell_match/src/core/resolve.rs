@@ -98,6 +98,13 @@ fn resolve(env: &mut TypeEnv, raw: &RawPat, b: &mut Bindings) -> Result<Pat> {
             }
             Pat::Con(con, rargs)
         }
+        RawPat::Hash(fields) => {
+            let mut out = Vec::with_capacity(fields.len());
+            for (k, p) in fields {
+                out.push((k.clone(), resolve(env, p, b)?));
+            }
+            Pat::Hash(out)
+        }
         RawPat::Record(name, fields, wildcard) => {
             let con = lookup(env, name)?;
             let (arity, field_names) = {

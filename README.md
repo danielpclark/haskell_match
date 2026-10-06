@@ -839,6 +839,165 @@ class Account
 end
 ```
 
+## Ruby values, Haskell discipline
+
+Everything above works on values you declare with `HaskellMatch.data`. This
+section is about the rest of Ruby: Hashes, the `Data` and `Struct` classes
+you already have, and the conveniences Haskell programmers expect.
+
+### Hash patterns
+
+A Ruby Hash literal is a Hash pattern (quoted: `{name = n, "key" = p}`).
+It matches a Hash that has every listed key (Symbol or String), with each
+value matched by its sub-pattern; other keys are ignored, like fields left
+out of a record pattern. A key whose value is `nil` counts as present.
+
+```ruby
+greet = HaskellMatch.fn(:greet) do
+  on({ name: n, title: t }) { |n, t| "#{t} #{n}" }
+  on({ name: n })           { |n| "hi #{n}" }
+  on({})                    { "anonymous" }          # {} matches every Hash
+end
+greet.(name: "Al", title: "Dr")   # => "Dr Al"
+greet.(name: "Al", age: 3)        # => "hi Al"
+```
+
+Exhaustiveness and redundancy are checked as for everything else: without
+a `{}` or `_` clause the checker reports `p1 where p1 is a Hash without the
+key name`; a clause needing a superset of an earlier clause's keys is
+redundant; a Hash column cannot be mixed with constructors or literals.
+Values nest (`{ user: { id: i } }`, `{ k: Just(x) }`), and a non-Hash
+argument with no wildcard clause is a `TypeMismatchError`.
+
+### Ruby classes as constructors
+
+A `Data` or `Struct` class visible from the definition needs no
+declaration: naming it in a pattern makes it a type with that single
+constructor, so one clause covers it and its members are its fields (record
+patterns included).
+
+```ruby
+Point = Data.define(:x, :y)
+norm = HaskellMatch.fn(:norm) { on(Point(x, y)) { |x, y| Math.hypot(x, y) } }
+norm.(Point.new(3, 4))                                           # => 5.0
+HaskellMatch.pattern("Point { x = a }").match(Point.new(1, 2))   # => {a: 1}
+```
+
+For several classes that together form one closed type (a sealed
+hierarchy), `HaskellMatch.sealed` lists them. `Data` and `Struct` classes
+bring their own field names; for any other class, name the reader methods
+that are its fields.
+
+```ruby
+Circle = Data.define(:r)
+Rect   = Data.define(:w, :h)
+class Tri
+  attr_reader :a, :b, :c
+  def initialize(a, b, c) = (@a, @b, @c = a, b, c)
+end
+
+Shape = HaskellMatch.sealed(:Shape, Circle, Rect, Tri => %i[a b c])
+
+area = HaskellMatch.fn(:area) do
+  on(Circle(r))    { |r| Math::PI * r * r }
+  on("Rect w h")   { |w, h| w * h }
+  # on("Tri a b c") missing:
+end
+# HaskellMatch::NonExhaustiveError: Patterns not matched: Tri _ _ _
+```
+
+The classes themselves are untouched apart from gaining a few readers
+(`constructor_name`, `field_names`, `data_type`). Instances are identified
+by exact class, so list the leaf classes of a hierarchy. The returned type
+module works like any other (`Shape === value`, `Shape.constructors`) and
+is defined as a constant only when you pass `under:`.
+
+### `deriving (Ord, Enum, Bounded)`
+
+`Eq` and `Show` always hold: constructor values compare structurally and
+`inspect` prints Haskell. Deriving the other standard classes adds:
+
+```ruby
+HaskellMatch.data "Color = Red | Green | Blue deriving (Eq, Ord, Enum, Bounded, Show)"
+include Color
+
+Red < Blue                                 # => true   (Ord: constructor order, then fields)
+[Blue, Red, Green].sort                    # => [Red, Green, Blue]
+Red.succ                                   # => Green  (Enum; Blue.succ raises, as in GHC)
+(Red..Blue).to_a                           # => [Red, Green, Blue]
+Color.enum_from(Green)                     # => [Green, Blue]
+Color.enum_from_then_to(Red, Blue, Blue)   # => [Red, Blue]
+Color.min_bound                            # => Red    (Bounded)
+Green.from_enum                            # => 1
+```
+
+`Ord` works for any type (`Pt 1 2 < Pt 1 3`); `Enum` and `Bounded` need an
+enumeration (every constructor nullary), as GHC requires. The Hash form
+takes `deriving: %i[Ord Enum]`. Unsupported class names are an error, and
+nothing is registered when a derivation fails.
+
+### Checked field types
+
+The types written in a declaration are documentation by default. With
+`check_types: true` (or `HaskellMatch.check_field_types = true` for all
+declarations) the constructor verifies each argument and raises
+`FieldTypeError` otherwise:
+
+```ruby
+HaskellMatch.data "Person = Person { name :: String, age :: Int, boss :: Maybe Person }",
+                  check_types: true
+Person.new("Al", "3", Nothing)
+# HaskellMatch::FieldTypeError: Person: field 'age' expects Int, got "3" (String)
+```
+
+`Int`/`Integer` take Integers; `Double`/`Float` any Numeric; `String` a
+String or list of characters; `Char` a one-character String; `Bool`
+true/false; `[a]` any list (Array, String, LazyList, Enumerator);
+`(a, b)` an Array of that size, elementwise; `a -> b` anything callable; a
+declared type (`Maybe Person`, `Shape`) a value of that type; any other
+capitalised name a Ruby class or module of that name when one exists
+(`Time`, `Hash`, `MyApp::Money`); type variables anything.
+
+### `where` helpers
+
+A local function inside a definition, like a Haskell `where` binding. It is
+a full `Function` (checked, with `tail` and `defer`), compiled with the
+enclosing function's options unless you override them, and reachable by
+name from every clause body and from the other helpers.
+
+```ruby
+sum_to = HaskellMatch.fn(:sum_to) do
+  on(n) { |n| go.(n, 0) }
+  where :go do
+    on(0, acc) { |acc| acc }
+    on(k, acc) { |k, acc| go.tail(k - 1, acc + k) }
+  end
+end
+sum_to.(1_000_000)        # => 500000500000
+sum_to.helpers            # => {"go" => #<HaskellMatch::Function go/2>}
+```
+
+Helpers do not see the enclosing clause's variables (pass them as
+arguments, as the example does), and in `ractor: true` mode they cannot
+call back into the enclosing function by name.
+
+### Composition
+
+`Function#>>` and `#<<` compose like `Proc`'s: `(f >> g).(x)` is
+`g.(f.(x))` (Haskell's `g . f`) and `(f << g).(x)` is `f.(g.(x))`.
+
+### Errors point at the problem
+
+Pattern syntax errors show the pattern with a caret under the offending
+column, and Haskell syntax errors show the offending line of the Ruby or
+`.hs` file:
+
+```
+HaskellMatch::PatternSyntaxError: clause 1: expected ')' but reached end of pattern
+    Just (x
+          ^
+```
+
 ## Inline Haskell and `.hs` files
 
 `HaskellMatch.haskell(source)` compiles Haskell source into a module and

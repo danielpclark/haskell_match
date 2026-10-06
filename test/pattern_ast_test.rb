@@ -113,7 +113,8 @@ class PatternAstTest < Minitest::Test
     assert_raises(HaskellMatch::DuplicateVariableError) { fn { on(tuple(x, x)) { 1 } } }
     assert_raises(HaskellMatch::FieldError) { fn { on(Person(nome: n)) { 1 } } }
     assert_raises(HaskellMatch::DefinitionError) { fn { on(nil) { 1 } } }
-    assert_raises(HaskellMatch::DefinitionError) { fn { on({ a: 1 }) { 1 } } }
+    assert_raises(HaskellMatch::NonExhaustiveError) { fn { on({ a: 1 }) { 1 } } } # a Hash pattern
+    assert_raises(HaskellMatch::DefinitionError) { fn { on({ 1 => x }) { 1 } } }
     assert_raises(HaskellMatch::DefinitionError) { fn { on(1..2) { 1 } } }
     assert_raises(HaskellMatch::DefinitionError) { fn { on([*xs, x]) { 1 } } }
     assert_raises(HaskellMatch::DefinitionError) { fn { on(Person(n, name: n)) { 1 } } }

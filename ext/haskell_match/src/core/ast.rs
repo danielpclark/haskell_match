@@ -97,6 +97,35 @@ impl fmt::Display for Lit {
     }
 }
 
+/// A key of a Hash pattern: a Ruby Symbol or String.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum HKey {
+    Sym(String),
+    Str(String),
+}
+
+impl fmt::Display for HKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            HKey::Sym(s) => {
+                let plain = s
+                    .chars()
+                    .next()
+                    .map(|c| c.is_ascii_lowercase() || c == '_')
+                    .unwrap_or(false)
+                    && s.chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '\'');
+                if plain {
+                    write!(f, "{}", s)
+                } else {
+                    write!(f, ":{:?}", s)
+                }
+            }
+            HKey::Str(s) => write!(f, "{:?}", s),
+        }
+    }
+}
+
 /// Unresolved pattern straight from the parser.
 #[derive(Clone, Debug, PartialEq)]
 pub enum RawPat {
@@ -116,6 +145,8 @@ pub enum RawPat {
     /// `p1 : p2`
     Cons(Box<RawPat>, Box<RawPat>),
     Lit(Lit),
+    /// `{ name = p1, "key" = p2 }`: a Ruby Hash with (at least) these keys.
+    Hash(Vec<(HKey, RawPat)>),
 }
 
 pub type VarId = usize;
@@ -131,6 +162,9 @@ pub enum Pat {
     Lazy(Box<Pat>),
     Con(super::types::ConId, Vec<Pat>),
     Lit(Lit),
+    /// A Hash having every listed key, whose values match the sub-patterns
+    /// (other keys are ignored, as fields not mentioned in a record pattern).
+    Hash(Vec<(HKey, Pat)>),
 }
 
 impl Pat {
@@ -141,6 +175,12 @@ impl Pat {
             Pat::As(_, p) => p.skeleton(),
             Pat::Con(c, args) => Pat::Con(*c, args.iter().map(Pat::skeleton).collect()),
             Pat::Lit(l) => Pat::Lit(l.clone()),
+            Pat::Hash(fields) => Pat::Hash(
+                fields
+                    .iter()
+                    .map(|(k, p)| (k.clone(), p.skeleton()))
+                    .collect(),
+            ),
         }
     }
 

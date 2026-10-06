@@ -24,9 +24,55 @@ module HaskellMatch
 
     attr_reader :clauses
 
-    def initialize(owner = nil)
+    def initialize(owner = nil, options = {})
       @clauses = []
       @owner = owner
+      @options = options
+      @helpers = {}
+    end
+
+    # A local helper function, like a Haskell `where` binding: defined with
+    # its own clauses and reachable by name from every clause body of the
+    # enclosing function (and from the other helpers).  It is a full
+    # {Function}: checked for exhaustiveness, with `tail` and `defer`, and
+    # compiled with the enclosing function's options unless overridden.
+    #
+    #   sum_to = HaskellMatch.fn(:sum_to) do
+    #     on(n) { |n| go.(n, 0) }
+    #     where :go do
+    #       on(0, acc) { |acc| acc }
+    #       on(k, acc) { |k, acc| go.tail(k - 1, acc + k) }
+    #     end
+    #   end
+    def where(name, **options, &definition)
+      raise DefinitionError, "where needs a block of on(...) clauses" unless definition
+
+      name = name.to_s
+      raise DefinitionError, "'#{name}' is not a valid helper name" unless name.match?(NAME_PATTERN)
+      raise DefinitionError, "helper '#{name}' is defined twice" if @helpers.key?(name)
+
+      helper = HaskellMatch.fn(name, **@options.merge(options), &definition)
+      @helpers[name] = helper
+      define_singleton_method(name) { helper }
+      helper
+    end
+
+    # Helper functions defined with {#where}, by name.
+    def helpers
+      @helpers.dup
+    end
+
+    # Resolve a constant the way code at the definition block would see it:
+    # through the receiver (a module, or an object's class) and so through
+    # its ancestors and `Object`.
+    def constant_resolver
+      owner = @owner
+      lambda do |name|
+        home = owner.is_a?(Module) ? owner : owner.class
+        home.const_defined?(name) ? home.const_get(name) : nil
+      rescue NameError
+        nil
+      end
     end
 
     # Add a clause: one pattern per argument, each either a Haskell pattern
@@ -79,8 +125,8 @@ module HaskellMatch
     # parameters, otherwise called with the builder as its argument.  Returns
     # the builder; call {#define_function} once the function exists so clause
     # bodies can recurse through `recur` or the function's name.
-    def self.collect(definition, ractor: false)
-      builder = ractor ? RactorHost.new_builder : new(definition.binding.receiver)
+    def self.collect(definition, ractor: false, options: {})
+      builder = ractor ? RactorHost.new_builder(options) : new(definition.binding.receiver, options)
       if definition.arity.zero?
         builder.instance_exec(&definition)
       else
@@ -113,15 +159,37 @@ module HaskellMatch
     module RactorHost
       include PatternAST::BuilderMethods
 
-      def self.new_builder
+      def self.new_builder(options = {})
         host = Module.new
         host.extend(RactorHost)
         host.instance_variable_set(:@clauses, [])
+        host.instance_variable_set(:@options, options)
+        host.instance_variable_set(:@helpers, {})
         host
       end
 
       def clauses
         @clauses
+      end
+
+      # A `where` helper (see {ClauseBuilder#where}); in Ractor mode helpers
+      # are themselves shareable functions and cannot call back into the
+      # enclosing function by name.
+      def where(name, **options, &definition)
+        raise DefinitionError, "where needs a block of on(...) clauses" unless definition
+
+        name = name.to_s
+        raise DefinitionError, "'#{name}' is not a valid helper name" unless name.match?(NAME_PATTERN)
+        raise DefinitionError, "helper '#{name}' is defined twice" if @helpers.key?(name)
+
+        helper = HaskellMatch.fn(name, **@options.merge(options), ractor: true, &definition)
+        @helpers[name] = helper
+        define_singleton_method(name, &Ractor.make_shareable(-> { helper }))
+        helper
+      end
+
+      def helpers
+        @helpers.dup
       end
 
       def on(*patterns, guard: nil, where: nil, location: nil, &body)
@@ -178,20 +246,59 @@ module HaskellMatch
       end
     end
 
+    # Construct a native matcher, registering top-level Ruby `Data`/`Struct`
+    # classes named by unknown constructors on the way and adding a caret to
+    # syntax errors.
+    def build_matcher(klass, name, patterns, guard_flags, limit, scope, resolver: nil)
+      tried = []
+      begin
+        klass.new(name, patterns, guard_flags, limit, scope)
+      rescue UnknownConstructorError => e
+        con = e.message[/data constructor '([^']+)'/, 1]
+        raise if con.nil? || tried.include?(con) || !autoregister(con, scope, resolver)
+
+        tried << con
+        retry
+      rescue PatternSyntaxError => e
+        raise e.exception(PatternSyntaxError.with_caret(e.message)), cause: nil
+      end
+    end
+
+    # A pattern named a constructor nobody declared: if a Ruby `Data` or
+    # `Struct` class of that name is visible (through `resolver`, which sees
+    # what the definition block sees, or at top level), it becomes a type of
+    # its own (`HaskellMatch.sealed`) so plain Ruby value classes match
+    # without a declaration.  Returns whether a type was registered.
+    def autoregister(name, scope, resolver = nil)
+      return false if HaskellMatch.constructor(name, scope)
+
+      klass = resolver&.call(name)
+      klass = Object.const_get(name) if klass.nil? && Object.const_defined?(name)
+      return false unless klass.is_a?(Class) && (klass < Data || klass < Struct)
+      return false if klass.singleton_class.include?(Constructor::SealedClassMethods) || klass.include?(Constructor)
+
+      HaskellMatch.sealed(name, klass, under: nil, scope: scope)
+      true
+    rescue NameError, CompileError
+      false
+    end
+
     # Returns [matcher, bodies, guards] where bodies/guards are arrays of
     # callables taking the bound values positionally.
     def compile(name, clauses, exhaustive:, overlapping:, kind: "equation", klass: Native::Matcher,
-                scope: Native::GLOBAL_SCOPE)
+                scope: Native::GLOBAL_SCOPE, resolver: nil)
       raise DefinitionError, "'#{name}' has no clauses" if clauses.empty?
 
       exhaustive = policy(exhaustive, :exhaustive)
       overlapping = policy(overlapping, :overlapping)
-      matcher = klass.new(
+      matcher = build_matcher(
+        klass,
         name.to_s,
         clauses.map(&:patterns),
         clauses.map { |c| !c.guard.nil? && !c.guard.equal?(ClauseBuilder::OTHERWISE) },
         WITNESS_LIMIT,
-        scope
+        scope,
+        resolver: resolver
       )
       report(name, kind, clauses, matcher, exhaustive, overlapping)
 

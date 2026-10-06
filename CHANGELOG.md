@@ -35,6 +35,28 @@ All notable changes to haskell_match are recorded here. The format follows
 - A type module forwards `new`, `[]` and `call` to a same-named constructor
   (`Person.new(...)` for `data Person = Person {...}`).
 - `on(..., location: [file, line])` to report a clause's origin.
+- **Hash patterns**: `{name = n, "key" = p}` (quoted) or a Ruby Hash literal
+  in place, matching a Hash that has the listed keys, with full
+  exhaustiveness and redundancy checking.
+- **Ruby classes as constructors**: `HaskellMatch.sealed(:Shape, Circle,
+  Rect, Tri => %i[a b c])` makes existing `Data`, `Struct` or plain classes
+  the constructors of a closed type; a `Data`/`Struct` class visible from a
+  definition is registered automatically as a single-constructor type when
+  a pattern names it.
+- **`deriving (Ord, Enum, Bounded)`** on data declarations (`Eq`/`Show`
+  already hold): comparison by constructor order, `succ`/`pred`/ranges,
+  `Type.enum_from*`, `Type.min_bound`/`max_bound`. Unsupported classes are
+  rejected before anything is registered.
+- **Checked field types**: `HaskellMatch.data "...", check_types: true` (or
+  `HaskellMatch.check_field_types = true`) verifies constructor arguments
+  against the declared Haskell types and raises `FieldTypeError`.
+- **`where` helpers** inside `fn` definitions: local checked functions
+  reachable by name from the clause bodies (`Function#helpers`).
+- `Function#>>` / `#<<` composition; `Function#scope`.
+- Pattern syntax errors show the pattern with a caret; Haskell syntax errors
+  show the offending source line with a caret.
+- `Native.parse_data` returns field types and the `deriving` list;
+  `Constructor.field_types`.
 
 ### Changed
 

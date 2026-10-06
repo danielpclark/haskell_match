@@ -19,7 +19,7 @@
 //! fpat    := var '=' pattern | var                -- NamedFieldPuns
 //! ```
 
-use super::ast::{Lit, RawPat};
+use super::ast::{HKey, Lit, RawPat};
 use super::error::{CoreError, ErrorKind, Result};
 use super::lexer::{tokenize, Tok, Token};
 
@@ -139,6 +139,7 @@ fn starts_apat(t: Option<&Tok>) -> bool {
             | Some(Tok::Str(_))
             | Some(Tok::Char(_))
             | Some(Tok::Sym(_))
+            | Some(Tok::LBrace)
             | Some(Tok::Underscore)
             | Some(Tok::LParen)
             | Some(Tok::LBracket)
@@ -268,6 +269,7 @@ fn apat(p: &mut P) -> Result<RawPat> {
             s.chars().next().expect("lexer checked length"),
         ))),
         Tok::Sym(s) => Ok(RawPat::Lit(Lit::Sym(s))),
+        Tok::LBrace => hash_fields(p),
         Tok::LParen => {
             if p.peek() == Some(&Tok::RParen) {
                 p.next();
@@ -311,6 +313,56 @@ fn apat(p: &mut P) -> Result<RawPat> {
         }
         other => Err(p.err(format!("unexpected {} in pattern", describe(&other)))),
     }
+}
+
+/// `{ key = pat, "str" = pat, .. }` after the opening brace: a Hash pattern.
+/// Keys are bare lower-case names or `:symbols` (Symbol keys) or string
+/// literals (String keys); `..` is accepted (Hash patterns are always open).
+fn hash_fields(p: &mut P) -> Result<RawPat> {
+    let mut fields: Vec<(HKey, RawPat)> = Vec::new();
+    if p.peek() == Some(&Tok::RBrace) {
+        p.next();
+        return Ok(RawPat::Hash(fields));
+    }
+    loop {
+        let key = match p.next() {
+            Some(Tok::VarId(k)) => HKey::Sym(k),
+            Some(Tok::Sym(k)) => HKey::Sym(k),
+            Some(Tok::Str(k)) => HKey::Str(k),
+            Some(Tok::DotDot) => {
+                p.expect(Tok::RBrace, "'}' after '..' in Hash pattern")?;
+                return Ok(RawPat::Hash(fields));
+            }
+            Some(t) => {
+                return Err(p.err(format!(
+                    "expected a key (name, :symbol or \"string\") in Hash pattern but found {}",
+                    describe(&t)
+                )))
+            }
+            None => return Err(p.err("unterminated Hash pattern".into())),
+        };
+        if fields.iter().any(|(k, _)| *k == key) {
+            return Err(CoreError::new(
+                ErrorKind::Field,
+                format!("key {} appears twice in a Hash pattern", key),
+            ));
+        }
+        p.expect(Tok::Equals, "'=' after a Hash pattern key")?;
+        let pat = pattern(p)?;
+        fields.push((key, pat));
+        match p.next() {
+            Some(Tok::Comma) => continue,
+            Some(Tok::RBrace) => break,
+            Some(t) => {
+                return Err(p.err(format!(
+                    "expected ',' or '}}' in Hash pattern but found {}",
+                    describe(&t)
+                )))
+            }
+            None => return Err(p.err("unterminated Hash pattern".into())),
+        }
+    }
+    Ok(RawPat::Hash(fields))
 }
 
 fn record_fields(p: &mut P, con: String) -> Result<RawPat> {
@@ -381,6 +433,8 @@ pub struct ConDecl {
     pub arity: usize,
     /// Field names for record syntax; `None` for positional constructors.
     pub fields: Option<Vec<String>>,
+    /// The declared type of each field, as written (one per field).
+    pub types: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -388,6 +442,8 @@ pub struct DataDecl {
     pub name: String,
     pub tyvars: Vec<String>,
     pub cons: Vec<ConDecl>,
+    /// Classes named in the `deriving` clause.
+    pub deriving: Vec<String>,
 }
 
 fn derr(p: &P, msg: String) -> CoreError {
@@ -441,6 +497,7 @@ pub fn parse_data(src: &str) -> Result<DataDecl> {
         }
     }
     let mut cons = Vec::new();
+    let mut deriving = Vec::new();
     loop {
         cons.push(con_decl(&mut p)?);
         match p.peek() {
@@ -448,8 +505,8 @@ pub fn parse_data(src: &str) -> Result<DataDecl> {
                 p.next();
             }
             Some(Tok::VarId(k)) if k == "deriving" => {
-                // skip the rest
-                p.i = p.toks.len();
+                p.next();
+                deriving = deriving_clause(&mut p)?;
                 break;
             }
             None => break,
@@ -473,7 +530,12 @@ pub fn parse_data(src: &str) -> Result<DataDecl> {
             ));
         }
     }
-    Ok(DataDecl { name, tyvars, cons })
+    Ok(DataDecl {
+        name,
+        tyvars,
+        cons,
+        deriving,
+    })
 }
 
 fn con_decl(p: &mut P) -> Result<ConDecl> {
@@ -496,8 +558,10 @@ fn con_decl(p: &mut P) -> Result<ConDecl> {
                 name,
                 arity: 0,
                 fields: Some(fields),
+                types: Vec::new(),
             });
         }
+        let mut types: Vec<String> = Vec::new();
         loop {
             // f1, f2 :: Type
             let mut names = Vec::new();
@@ -524,8 +588,11 @@ fn con_decl(p: &mut P) -> Result<ConDecl> {
                     None => return Err(derr(p, "unterminated record declaration".into())),
                 }
             }
+            let from = p.i;
             type_expr(p)?;
+            let ty_text = span_text(p, from);
             for f in names {
+                types.push(ty_text.clone());
                 if fields.contains(&f) {
                     return Err(CoreError::new(
                         ErrorKind::DataDeclaration,
@@ -551,18 +618,100 @@ fn con_decl(p: &mut P) -> Result<ConDecl> {
             name,
             arity,
             fields: Some(fields),
+            types,
         });
     }
     let mut arity = 0;
+    let mut types = Vec::new();
     while starts_atype(p.peek()) {
+        let from = p.i;
         atype(p)?;
+        types.push(span_text(p, from));
         arity += 1;
     }
     Ok(ConDecl {
         name,
         arity,
         fields: None,
+        types,
     })
+}
+
+/// `deriving Show` or `deriving (Eq, Ord, Show)`.
+fn deriving_clause(p: &mut P) -> Result<Vec<String>> {
+    let mut out = Vec::new();
+    match p.next() {
+        Some(Tok::ConId(c)) => out.push(c),
+        Some(Tok::LParen) => {
+            if p.peek() == Some(&Tok::RParen) {
+                p.next();
+            } else {
+                loop {
+                    match p.next() {
+                        Some(Tok::ConId(c)) => out.push(c),
+                        Some(t) => {
+                            return Err(derr(
+                                p,
+                                format!(
+                                    "expected a class name in deriving but found {}",
+                                    describe(&t)
+                                ),
+                            ))
+                        }
+                        None => return Err(derr(p, "unterminated deriving clause".into())),
+                    }
+                    match p.next() {
+                        Some(Tok::Comma) => continue,
+                        Some(Tok::RParen) => break,
+                        Some(t) => {
+                            return Err(derr(
+                                p,
+                                format!(
+                                    "expected ',' or ')' in deriving but found {}",
+                                    describe(&t)
+                                ),
+                            ))
+                        }
+                        None => return Err(derr(p, "unterminated deriving clause".into())),
+                    }
+                }
+            }
+        }
+        Some(t) => {
+            return Err(derr(
+                p,
+                format!(
+                    "expected a class name after deriving but found {}",
+                    describe(&t)
+                ),
+            ))
+        }
+        None => return Err(derr(p, "expected a class name after deriving".into())),
+    }
+    if let Some(t) = p.peek() {
+        return Err(derr(
+            p,
+            format!("unexpected {} after deriving clause", describe(t)),
+        ));
+    }
+    Ok(out)
+}
+
+/// The source text spanned by tokens `from..p.i` (for field types).
+fn span_text(p: &P, from: usize) -> String {
+    let start = p.toks[from].pos;
+    let end = p
+        .toks
+        .get(p.i)
+        .map(|t| t.pos)
+        .unwrap_or(p.src.chars().count());
+    p.src
+        .chars()
+        .skip(start)
+        .take(end - start)
+        .collect::<String>()
+        .trim()
+        .to_string()
 }
 
 fn starts_atype(t: Option<&Tok>) -> bool {
@@ -790,21 +939,33 @@ mod tests {
                 ConDecl {
                     name: "Nothing".into(),
                     arity: 0,
-                    fields: None
+                    fields: None,
+                    types: vec![],
                 },
                 ConDecl {
                     name: "Just".into(),
                     arity: 1,
-                    fields: None
+                    fields: None,
+                    types: vec!["a".into()],
                 },
             ]
         );
+        assert!(d.deriving.is_empty());
 
         let d = parse_data("Shape = Circle Double | Rect Double Double | Poly [(Double, Double)] deriving (Show, Eq)").unwrap();
         assert_eq!(
             d.cons.iter().map(|c| c.arity).collect::<Vec<_>>(),
             vec![1, 2, 1]
         );
+        assert_eq!(d.cons[2].types, vec!["[(Double, Double)]".to_string()]);
+        assert_eq!(d.deriving, vec!["Show".to_string(), "Eq".to_string()]);
+        let d = parse_data("P = P { name :: String, age, score :: Int } deriving Ord").unwrap();
+        assert_eq!(
+            d.cons[0].types,
+            vec!["String".to_string(), "Int".to_string(), "Int".to_string()]
+        );
+        assert_eq!(d.deriving, vec!["Ord".to_string()]);
+        assert!(parse_data("P = P deriving (Eq").is_err());
 
         let d = parse_data("Tree a = Leaf | Node (Tree a) a (Tree a)").unwrap();
         assert_eq!(d.cons[1].arity, 3);

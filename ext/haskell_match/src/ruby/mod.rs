@@ -333,25 +333,27 @@ fn rstrings(items: &[String]) -> Array {
 methods!(
     Native,
     _rtself,
-    // parse_data(decl) -> [name, tyvars, [[con, arity, fields_or_nil], ...]]
+    // parse_data(decl) -> [name, tyvars, [[con, arity, fields_or_nil, types], ...], deriving]
     fn native_parse_data(decl: RString) -> Array {
         let decl = decl.unwrap_or_else(|_| raise_arg("data declaration must be a String"));
         let d = parse_data(&decl.to_string()).unwrap_or_else(|e| raise_core(e));
         let mut cons = Array::with_capacity(d.cons.len());
         for c in &d.cons {
-            let mut row = Array::with_capacity(3);
+            let mut row = Array::with_capacity(4);
             row.push(RString::new_utf8(&c.name));
             row.push(Integer::new(c.arity as i64));
             match &c.fields {
                 Some(fs) => row.push(rstrings(fs).to_any_object()),
                 None => row.push(NilClass::new().to_any_object()),
             };
+            row.push(rstrings(&c.types));
             cons.push(row);
         }
-        let mut out = Array::with_capacity(3);
+        let mut out = Array::with_capacity(4);
         out.push(RString::new_utf8(&d.name));
         out.push(rstrings(&d.tyvars));
         out.push(cons);
+        out.push(rstrings(&d.deriving));
         out
     },
     // new_scope -> Integer: a type scope seeded from the global registry

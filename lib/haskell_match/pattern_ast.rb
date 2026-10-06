@@ -211,6 +211,7 @@ module HaskellMatch
       when true then "True"
       when false then "False"
       when Array then list(obj)
+      when Hash then hash_pattern(obj)
       when Constructor then constructor(obj, atomic)
       when Class
         if obj < Data && obj.include?(Constructor)
@@ -244,6 +245,24 @@ module HaskellMatch
       end
 
       "[#{items.map { |i| render(i) }.join(', ')}]"
+    end
+
+    # `{name: n, "k" => v}` -> `{name = n, "k" = v}`: a Hash having those keys
+    # (Symbol or String), whose values match the sub-patterns; other keys are
+    # ignored.  `**_` (the record-pattern rest marker) is accepted and means
+    # nothing extra, since Hash patterns are always open.
+    def hash_pattern(hash)
+      parts = hash.filter_map do |k, v|
+        next if k == REST_KEY
+
+        key = case k
+              when Symbol then k.to_s.match?(/\A[a-z_][A-Za-z0-9_']*\z/) ? k.to_s : ":#{k.to_s.inspect}"
+              when String then k.inspect
+              else raise DefinitionError, "Hash pattern keys must be Symbols or Strings (got #{k.inspect})"
+              end
+        "#{key} = #{render(v)}"
+      end
+      "{#{parts.join(', ')}}"
     end
 
     def constructor(value, atomic)
