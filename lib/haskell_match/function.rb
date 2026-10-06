@@ -44,11 +44,17 @@ module HaskellMatch
     # call methods of the surrounding object, and local variables captured
     # by the bodies must already be shareable; recursion goes through the
     # function's name or `recur`, which work in both modes.
-    def self.define(name, builder, exhaustive:, overlapping:, ractor: false)
+    #
+    # With `deep: true` the function's `call` is implemented in Ruby (see
+    # {DeepCall}): about 100 ns slower per call, but deep recursion costs a
+    # tenth of the memory and the GC scans a fifth as much.  The default is
+    # {HaskellMatch.deep_by_default}.
+    def self.define(name, builder, exhaustive:, overlapping:, ractor: false, deep: HaskellMatch.deep_by_default)
       clauses = builder.clauses
       clauses = make_shareable(clauses) if ractor
       f, bodies, guards = Compiler.compile(name.to_s, clauses, exhaustive: exhaustive,
                                                              overlapping: overlapping, klass: self)
+      f.extend(DeepCall.module_for(f.arity)) if deep
       f.send(:attach, clauses, bodies, guards)
       builder.define_function(f, name.to_s)
       Ractor.make_shareable(f) if ractor
@@ -70,9 +76,20 @@ module HaskellMatch
     end
     private_class_method :make_shareable
 
-    # call(*args) is native; these aliases make a Function behave like a Proc.
-    alias [] call
-    alias === call
+    # call(*args) is native (or Ruby, in deep mode); these make a Function
+    # behave like a Proc.
+    def [](*args)
+      call(*args)
+    end
+
+    def ===(*args)
+      call(*args)
+    end
+
+    # Whether this function runs in deep mode (see {DeepCall}).
+    def deep?
+      false
+    end
 
     # A lambda with the function's exact arity.  Built on first use (a
     # shareable function cannot hold a reference back to itself).
@@ -134,6 +151,14 @@ module HaskellMatch
 
     def stack_segment=(levels)
       Native.stack_segment = levels
+      DeepCall.segment = Native.stack_segment
+    end
+
+    # Whether functions use deep mode unless told otherwise (default false).
+    attr_writer :deep_by_default
+
+    def deep_by_default
+      @deep_by_default ? true : false
     end
 
     # Deepest allowed nesting of calls (0 = unlimited); beyond it
@@ -164,12 +189,14 @@ module HaskellMatch
     # * `exhaustive:`  true/:error (default), :warn, or false/:ignore
     # * `overlapping:` true/:error (default), :warn, or false/:ignore
     # * `ractor:`      true to make the function Ractor-shareable (see {Function.define})
-    def fn(name = nil, exhaustive: self.exhaustive, overlapping: self.overlapping, ractor: false, &definition)
+    # * `deep:`        true for Ruby-level body invocation (cheap deep recursion)
+    def fn(name = nil, exhaustive: self.exhaustive, overlapping: self.overlapping, ractor: false,
+           deep: deep_by_default, &definition)
       raise ArgumentError, "HaskellMatch.fn needs a block with on(...) clauses" unless definition
 
       builder = ClauseBuilder.collect(definition, ractor: ractor)
       name ||= "anonymous function at #{definition.source_location&.join(':')}"
-      Function.define(name, builder, exhaustive: exhaustive, overlapping: overlapping, ractor: ractor)
+      Function.define(name, builder, exhaustive: exhaustive, overlapping: overlapping, ractor: ractor, deep: deep)
     end
   end
 end

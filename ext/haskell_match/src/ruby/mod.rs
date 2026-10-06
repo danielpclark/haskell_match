@@ -834,6 +834,64 @@ unsafe extern "C" fn matcher_call(argc: c_int, argv: *const Value, rtself: Value
     }
 }
 
+/// matcher.prepare(*args) -> [values..., body, depth]: the selected clause's
+/// bound values, its body (from `@bodies`, guards from `@guards`) and the
+/// nesting depth after counting this call, for callers that invoke the body
+/// from Ruby code (see `Function` deep mode); they call `Native.depth_pop`
+/// once the body has returned.
+unsafe extern "C" fn matcher_prepare(argc: c_int, argv: *const Value, rtself: Value) -> Value {
+    let mut buf = [Value::from(0); STACK_BINDS];
+    let args = std::slice::from_raw_parts(argv, argc.max(0) as usize);
+    let outcome = catch_unwind(AssertUnwindSafe(|| -> Result<Prepared, RtError> {
+        let m = matcher_of(rtself);
+        let bodies = rclass::rb_ivar_get(rtself, ids().bodies);
+        let guards = rclass::rb_ivar_get(rtself, ids().guards);
+        prepare(m, args, bodies, guards, &mut buf)
+    }));
+    match outcome {
+        Err(payload) => raise_panic(payload),
+        Ok(Err(e)) => raise_rt(&matcher_of(rtself).name, e),
+        Ok(Ok(p)) => {
+            if p.body.is_nil() {
+                raise_arg("this matcher has no clause bodies attached");
+            }
+            let out = match p.bound {
+                Bound::Stack(n) => array::rb_ary_new_from_values(n as _, buf.as_ptr()),
+                Bound::Array(a) => a,
+            };
+            array::rb_ary_push(out, p.body);
+            // Count this level now; the Ruby caller pops it after the body.
+            let depth = native_depth_push(rtself);
+            array::rb_ary_push(out, depth);
+            out
+        }
+    }
+}
+
+/// Native.depth_push -> the new nesting depth (raises StackOverflowError past
+/// max_depth); Native.depth_pop undoes it.  Used by deep-mode functions,
+/// whose body invocation happens in Ruby.
+unsafe extern "C" fn native_depth_push(_rtself: Value) -> Value {
+    let depth = DEPTH.with(|d| d.get());
+    let max = MAX_DEPTH.load(std::sync::atomic::Ordering::Relaxed);
+    if max > 0 && depth >= max {
+        VM::raise_ex(exception(
+            "StackOverflowError",
+            &format!(
+                "recursion deeper than HaskellMatch.max_depth ({}); use tail calls, defer, or raise the limit",
+                max
+            ),
+        ));
+    }
+    DEPTH.with(|d| d.set(depth + 1));
+    Integer::new((depth + 1) as i64).value()
+}
+
+unsafe extern "C" fn native_depth_pop(_rtself: Value) -> Value {
+    DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+    Value::from(rutie::rubysys::value::RubySpecialConsts::Nil as usize)
+}
+
 /// matcher.select(*args) -> [clause_index, [values]] or nil (guards from
 /// `@guards`).
 unsafe extern "C" fn matcher_select(argc: c_int, argv: *const Value, rtself: Value) -> Value {
@@ -974,6 +1032,13 @@ pub fn init() {
     unsafe { VM::ext_ractor_safe(true) };
     let mut hm = Module::from_existing("HaskellMatch");
     let mut native = hm.define_nested_module("Native");
+    unsafe {
+        let n = native.value();
+        let push = CString::new("depth_push").unwrap();
+        let pop = CString::new("depth_pop").unwrap();
+        rclass::rb_define_singleton_method(n, push.as_ptr(), native_depth_push as CallbackPtr, 0);
+        rclass::rb_define_singleton_method(n, pop.as_ptr(), native_depth_pop as CallbackPtr, 0);
+    }
     native.define(|m| {
         m.def_self("parse_data", native_parse_data);
         m.def_self("register_type", native_register_type);
@@ -993,6 +1058,7 @@ pub fn init() {
         let new_name = CString::new("new").unwrap();
         rclass::rb_define_singleton_method(k, new_name.as_ptr(), matcher_new as CallbackPtr, 4);
         def_method(k, "call", matcher_call as CallbackPtr, -1);
+        def_method(k, "prepare", matcher_prepare as CallbackPtr, -1);
         def_method(k, "select", matcher_select as CallbackPtr, -1);
         def_method(k, "select_with", matcher_select_with as CallbackPtr, 2);
         def_method(k, "run", matcher_run as CallbackPtr, 3);

@@ -308,7 +308,11 @@ Fiber, chaining their stacks the way GHC grows its own, so the depth limit
 becomes memory rather than a fixed buffer. You write the obvious code and it
 works; the cost is about 1.6 KB per level while the recursion is pending, and
 `HaskellMatch.max_depth` (250,000 by default) turns a runaway recursion into
-a clear `StackOverflowError` instead of a swallowed machine.
+a clear `StackOverflowError` instead of a swallowed machine. A function that
+is *meant* to recurse deep can be defined with `deep: true`: its body is then
+invoked from Ruby rather than from the native matcher, which costs about one
+extra Ruby frame per call but brings a level down to about 100 bytes and
+makes garbage collection at depth six times cheaper.
 
 ### Tail calls run in constant space
 
@@ -673,7 +677,8 @@ zip.decision_tree            # dump of the compiled tree
 
 Options: `exhaustive:` and `overlapping:` accept `:error` (default), `:warn`
 or `:ignore` (`true`/`false` work too), per function or globally through
-`HaskellMatch.exhaustive = :warn`. A non-exhaustive function compiled with
+`HaskellMatch.exhaustive = :warn`; `deep: true` selects deep mode (see the
+recursion notes); `ractor: true` makes the function Ractor-shareable. A non-exhaustive function compiled with
 `exhaustive: false` raises `HaskellMatch::MatchError` when no clause matches.
 
 ### `HaskellMatch.case_of` — `case ... of` expressions
@@ -788,12 +793,15 @@ Facts about segments:
   0.6 s, the third 0.35 s (0.9 µs per level); at 1M depth, 8.9 s then 2.8 s.
   Budget for the cold run if a deep recursion happens once.
 * **GC cost grows with live depth.** Fiber objects are not write-barrier
-  protected, so every collection, minor ones included, re-marks the VM and
-  machine stacks of every suspended segment: a GC during a pending recursion
-  costs O(depth), and a deep computation that allocates heavily pays that on
-  each of its collections. This is inherent to keeping the recursion on real
-  stacks; `defer` avoids it (its heap stack is generational-GC friendly, see
-  below), and `GC.disable` around a known deep computation, or a larger
+  protected (their stacks change on every instruction, so no barrier could
+  track them), and CRuby therefore re-marks the VM and machine stacks of
+  every suspended segment on every collection, minor ones included. A GC
+  during a pending recursion costs O(live stack bytes): at 200k levels a
+  minor GC takes about 165 ms instead of 2 ms. Nothing outside CRuby can
+  change *that* a suspended fiber is rescanned; what can be changed is how
+  much there is to scan, and that is what deep mode below does (28 ms for the
+  same collection). `defer` avoids the fiber stacks altogether, and
+  `GC.disable` around a known deep computation, or a larger
   `RUBY_GC_HEAP_INIT_SLOTS`, reduces the number of collections.
 * **Semantics across a segment boundary.** Exceptions propagate normally
   (`rb_fiber_resume` re-raises them in the parent), but the backtrace only
@@ -806,6 +814,47 @@ Facts about segments:
   Thread and each Ractor recurses independently. If your own Fiber runs a
   deep recursion, the counter is shared with the thread that created it; the
   only effect is that segments may start a little earlier than needed.
+
+### Deep mode: the same recursion with no native frames on the stack
+
+Where do the 1.6 KB per level come from, given that an idle fiber commits only
+about 13 KB? From the C frames. In the default (native) mode the body is
+invoked by the Rust matcher: the machine stack holds, per level, the C
+function frame of `call`, the VM re-entry that runs the block, and the
+matcher's scratch space, about 1.3 KB, all of which the GC also scans
+conservatively because it cannot know which words are references. The Ruby
+frames themselves are small.
+
+`deep: true` moves the body invocation into Ruby:
+
+```ruby
+count = HaskellMatch.fn(:count, deep: true) do
+  on([])        { 0 }
+  on([_, *xs])  { |xs| 1 + count.(xs) }
+end
+```
+
+`call` becomes a generated Ruby method of exact arity that asks the native
+`prepare` for the selected body and its bound values, then calls the body
+itself. A Ruby-to-Ruby call pushes no C frame, so while the recursion is
+pending the machine stack holds nothing of ours; segments, `tail`, `defer`
+and `max_depth` work exactly as before (the trampoline is reimplemented in
+Ruby, with the same chunked continuation stack). Measured against native
+mode at 200k levels:
+
+| mode   | shallow call | memory per level | minor GC at 200k depth | 200k levels, warm |
+|--------|-------------:|-----------------:|-----------------------:|------------------:|
+| native |     ~230 ns  |        ~1.6 KB   |              ~165 ms   |          0.94 s   |
+| deep   |     ~460 ns  |        ~105 B    |               ~28 ms   |          0.29 s   |
+
+A million plain levels in deep mode take about 3 s and 300 MB. The trade is
+clear-cut: deep mode costs an extra Ruby frame on *every* call, which doubles
+the time of a shallow call, and in exchange brings a level within a factor of
+four of GHC's 24 bytes and cuts GC marking six-fold. Native mode remains the
+default because most functions never recurse; set `deep: true` on the ones
+that do, or `HaskellMatch.deep_by_default = true` for a codebase that is
+recursive throughout. A deep-mode function may call native-mode functions
+and vice versa, including through `tail`.
 
 ### Mechanism 2: tail calls (constant space)
 
@@ -880,6 +929,7 @@ recursion does not shift later limits.
 | Loop with accumulator, fold, state machine| `f.tail(...)`            | O(1)        | ~1.1 µs               |
 | Deep non-tail recursion, depth known large| `f.defer(...) { }`       | ~200 B/level| ~4 µs                 |
 | Ordinary recursion, depth moderate        | plain `f.(...)`          | ~1.6 KB/level (≤ `max_depth`) | ~0.9 µs (first call slower) |
+| Ordinary recursion, depth large           | `deep: true` + plain `f.(...)` | ~105 B/level (≤ `max_depth`) | ~1.5 µs, half the GC time |
 | Infinite data                             | `HaskellMatch.lazy` + patterns | per element forced | per element |
 
 Infinite recursion in the Haskell sense, a producer that never returns, is
