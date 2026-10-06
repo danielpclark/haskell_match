@@ -28,12 +28,17 @@ class RactorTest < Minitest::Test
       Ractor.new(from_maybe, Just.new(5)) { |f, v| [f.(0, v), f.(7, Nothing), f.(0, Just.new(500))] }.take
     end
     assert_equal [5, 7, :big], result
-    # recursion must go through a constant: captured locals are snapshotted
-    # when the clause procs are made shareable
-    assert_equal 3, quietly { Ractor.new { RactorTest::LEN.([1, 2, 3]) }.take }
+    # recursion through the function's own name or `recur` (a local variable
+    # of the same name would shadow the name and is snapshotted as nil by
+    # make_shareable, so the function is assigned to a differently named one)
+    f = fn(:len, ractor: true) { on("[]") { 0 }; on("(_:xs)") { |xs| 1 + len.(xs) } }
+    assert_equal 3, quietly { Ractor.new(f) { |g| g.([1, 2, 3]) }.take }
+    fact = fn(ractor: true) { on("0") { 1 }; on("n") { |n| n * recur.(n - 1) } }
+    assert_equal 120, quietly { Ractor.new(fact) { |f| f.(5) }.take }
+    # tail calls in a Ractor
+    go = fn(:go, ractor: true) { on("acc", "[]") { |acc| acc }; on("acc", "(x:xs)") { |acc, x, xs| recur.tail(acc + x, xs) } }
+    assert_equal 5_000_050_000, quietly { Ractor.new(go) { |g| g.(0, (1..100_000).to_a) }.take }
   end
-
-  LEN = HaskellMatch.fn(:len, ractor: true) { on("[]") { 0 }; on("(_:xs)") { |xs| 1 + LEN.(xs) } }
 
   def test_functions_with_a_non_shareable_self_are_rejected_only_when_asked
     plain = fn { on("x") { |x| x } }

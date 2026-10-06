@@ -23,7 +23,7 @@ module HaskellMatch
       raise ArgumentError, "case_of needs a block with on(...) clauses" unless definition
       raise ArgumentError, "case_of needs at least one value" if values.empty?
 
-      clauses = ClauseBuilder.collect(definition)
+      clauses = ClauseBuilder.collect(definition).clauses
       key = cache_key(clauses, exhaustive, overlapping)
       entry = LOCK.synchronize { CACHE[key] }
       unless entry

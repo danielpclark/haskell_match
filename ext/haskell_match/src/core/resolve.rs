@@ -273,12 +273,12 @@ mod tests {
             pats[0],
             Pat::Con(env.lookup_con("Just").unwrap(), vec![Pat::Wild])
         );
-        let (pats, _) = res(&mut env, &["Person \"bob\" 3"]).unwrap();
+        let (pats, _) = res(&mut env, &["Person 'b' 3"]).unwrap();
         assert_eq!(
             pats[0],
             Pat::Con(
                 person,
-                vec![Pat::Lit(Lit::Str("bob".into())), Pat::Lit(Lit::Int(3))]
+                vec![Pat::Lit(Lit::Char('b')), Pat::Lit(Lit::Int(3))]
             )
         );
     }

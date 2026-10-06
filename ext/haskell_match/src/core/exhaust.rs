@@ -414,7 +414,15 @@ mod tests {
         );
         assert_eq!(
             run(&mut env, &[&["\"a\""]]).0,
-            vec!["p1 where p1 is not one of {\"a\"}"]
+            vec!["[]", "('a':_:_)", "(p1:_) where p1 is not one of {'a'}"]
+        );
+        assert_eq!(
+            run(&mut env, &[&["\"\""], &["(c:cs)"]]).0,
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            run(&mut env, &[&["'a'"]]).0,
+            vec!["p1 where p1 is not one of {'a'}"]
         );
         assert_eq!(
             run(&mut env, &[&["Circle _"]]).0,

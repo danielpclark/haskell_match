@@ -177,9 +177,17 @@ mod tests {
             e.message
         );
 
-        let cs = clauses(&mut env, &[&["Just 0"], &["Just \"s\""]]);
+        let cs = clauses(&mut env, &[&["Just 0"], &["Just 's'"]]);
         let e = check(&env, &cs).unwrap_err();
         assert!(e.message.contains("field 1 of 'Just'"), "{}", e.message);
+        // Char and String ([Char]) are different types, as in Haskell
+        let cs = clauses(&mut env, &[&["'a'"], &["\"a\""]]);
+        assert!(check(&env, &cs).is_err());
+        // but string literals unify with list patterns
+        let cs = clauses(&mut env, &[&["\"\""], &["(c:cs)"]]);
+        check(&env, &cs).unwrap();
+        let cs = clauses(&mut env, &[&["\"yes\""], &["['n', _]"], &["_"]]);
+        check(&env, &cs).unwrap();
 
         let cs = clauses(&mut env, &[&["(a, b)"], &["[]"]]);
         assert!(check(&env, &cs).is_err());

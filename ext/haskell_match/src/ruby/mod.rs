@@ -15,7 +15,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{Mutex, OnceLock};
 
 use rutie::rubysys::typed_data::{RUBY_TYPED_FREE_IMMEDIATELY, RUBY_TYPED_FROZEN_SHAREABLE};
-use rutie::rubysys::{array, class as rclass, value::ValueType};
+use rutie::rubysys::{array, class as rclass, rstruct, value::ValueType};
 use rutie::typed_data::DataTypeWrapper;
 use rutie::types::{CallbackPtr, DataType, DataTypeFunction, Id, Value};
 use rutie::{
@@ -45,6 +45,18 @@ struct Ids {
 }
 
 static IDS: OnceLock<Ids> = OnceLock::new();
+
+/// `HaskellMatch::TailCall`, the marker a clause body returns to request a
+/// tail call (looked up once, on first use).
+static TAIL_CALL: OnceLock<usize> = OnceLock::new();
+
+fn tail_call_class() -> usize {
+    *TAIL_CALL.get_or_init(|| {
+        let k = hm_class("TailCall");
+        unsafe { rutie::rubysys::gc::rb_gc_register_mark_object(k.value()) };
+        k.value().value
+    })
+}
 
 fn ids() -> &'static Ids {
     IDS.get_or_init(|| unsafe {
@@ -586,25 +598,69 @@ fn check_guards(guards: Value) -> Result<(), String> {
 
 /// matcher.call(*args): select a clause and call its body (from `@bodies`,
 /// with guards from `@guards`).
+///
+/// A body may return a `HaskellMatch::TailCall` (see `Function#tail`): the
+/// call then continues with that marker's function and arguments without
+/// growing either stack, so tail-recursive loops run in constant space as
+/// they do in Haskell.
 unsafe extern "C" fn matcher_call(argc: c_int, argv: *const Value, rtself: Value) -> Value {
     let mut buf = [Value::from(0); STACK_BINDS];
-    let args = std::slice::from_raw_parts(argv, argc.max(0) as usize);
-    let outcome = catch_unwind(AssertUnwindSafe(|| -> Result<Prepared, RtError> {
-        let m = matcher_of(rtself);
-        let bodies = rclass::rb_ivar_get(rtself, ids().bodies);
-        let guards = rclass::rb_ivar_get(rtself, ids().guards);
-        prepare(m, args, bodies, guards, &mut buf)
-    }));
-    match outcome {
-        Err(payload) => raise_panic(payload),
-        Ok(Err(e)) => raise_rt(&matcher_of(rtself).name, e),
-        Ok(Ok(p)) => {
-            if p.body.is_nil() {
-                raise_arg("this matcher has no clause bodies attached");
+    let mut target = rtself;
+    // The marker object (if any) keeps the next arguments alive while they
+    // are matched; it is held in this frame so the GC's stack scan sees it.
+    let mut marker = Value::from(0);
+    let mut args_vec: Vec<Value> = Vec::new();
+    let mut first = true;
+    loop {
+        let args: &[Value] = if first {
+            std::slice::from_raw_parts(argv, argc.max(0) as usize)
+        } else {
+            &args_vec[..]
+        };
+        let outcome = catch_unwind(AssertUnwindSafe(|| -> Result<Prepared, RtError> {
+            let m = matcher_of(target);
+            let bodies = rclass::rb_ivar_get(target, ids().bodies);
+            let guards = rclass::rb_ivar_get(target, ids().guards);
+            prepare(m, args, bodies, guards, &mut buf)
+        }));
+        let p = match outcome {
+            Err(payload) => {
+                drop(args_vec);
+                raise_panic(payload)
             }
-            // No Rust value needing Drop is live here: the body may longjmp.
-            runtime::invoke(p.body, &p.bound, &buf)
+            Ok(Err(e)) => {
+                drop(args_vec);
+                raise_rt(&matcher_of(target).name, e)
+            }
+            Ok(Ok(p)) => p,
+        };
+        if p.body.is_nil() {
+            drop(args_vec);
+            raise_arg("this matcher has no clause bodies attached");
         }
+        // Nothing needing Drop must be live across the body call, which may
+        // longjmp: `args_vec` is emptied first (its arguments are rooted by
+        // `marker` anyway).
+        drop(std::mem::take(&mut args_vec));
+        let result = runtime::invoke(p.body, &p.bound, &buf);
+        if rclass::rb_obj_class(result).value != tail_call_class() {
+            std::hint::black_box(marker);
+            return result;
+        }
+        // TailCall(function, args): continue with the next iteration.
+        marker = result;
+        let function = rstruct::rb_struct_aref(result, Integer::new(0).value());
+        let next_args = rstruct::rb_struct_aref(result, Integer::new(1).value());
+        if next_args.ty() != ValueType::Array {
+            raise_arg("TailCall arguments must be an Array");
+        }
+        // The matcher type is checked by `matcher_of` on the next iteration.
+        target = function;
+        let n = array::rb_ary_len(next_args) as usize;
+        args_vec = (0..n)
+            .map(|i| array::rb_ary_entry(next_args, i as _))
+            .collect();
+        first = false;
     }
 }
 

@@ -35,7 +35,7 @@ module HaskellMatch
     def hdef(name, exhaustive: HaskellMatch.exhaustive, overlapping: HaskellMatch.overlapping, &definition)
       raise ArgumentError, "hdef needs a block with on(...) clauses" unless definition
 
-      clauses = ClauseBuilder.collect(definition)
+      clauses = ClauseBuilder.collect(definition).clauses
       matcher, _bodies, _guards = Compiler.compile(name, clauses, exhaustive: exhaustive, overlapping: overlapping)
       names = matcher.names
       guards = clauses.map { |c| c.guard.equal?(ClauseBuilder::OTHERWISE) ? nil : c.guard }

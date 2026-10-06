@@ -28,6 +28,8 @@ class PatternTest < Minitest::Test
     p = HaskellMatch.pattern("Just x")
     assert_raises(HaskellMatch::TypeMismatchError) { p.match(5) }
     refute p === 5
+    assert_equal({}, HaskellMatch.pattern("_").match(5))
+    assert_equal({ s: "hi" }, HaskellMatch.pattern("s@(_:_)").match("hi"))
     assert p === Just.new(1)
     refute p === Nothing
   end
@@ -68,7 +70,8 @@ class PatternTest < Minitest::Test
     assert_equal "all@(x:_)", HaskellMatch::Native.render_pattern("all@(x:_)")
     assert_equal "~(Just y)", HaskellMatch::Native.render_pattern("~(Just y)")
     assert_equal "x", HaskellMatch::Native.render_pattern("!x")
-    assert_equal "Just \"s\"", HaskellMatch::Native.render_pattern("Just 's'")
+    assert_equal "Just 's'", HaskellMatch::Native.render_pattern("Just 's'")
+    assert_equal "Just ['s']", HaskellMatch::Native.render_pattern("Just \"s\"")
     assert_equal "2", HaskellMatch::Native.render_pattern("2.0")
   end
 end

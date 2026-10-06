@@ -12,8 +12,10 @@ Haskell's pattern matching for Ruby, implemented in Rust with
 * **Every logical path accounted for.** Like GHC, the compiler rejects a
   function whose clauses are not exhaustive and lists the patterns not
   matched; it also rejects clauses that can never be reached. Positions whose
-  patterns disagree in type are a compile error. At run time a value of the
-  wrong type raises, rather than silently matching a wildcard.
+  patterns disagree in type are a compile error. At run time a value that no
+  pattern of the function could accept raises a type-mismatch error (the
+  error Haskell's type checker would have given), while `_` and variables
+  match anything, exactly as in Haskell.
 * **Fast.** Clauses are compiled once (Maranget-style) into a decision tree
   that inspects each argument position at most once per path, and matching
   runs in Rust directly over Ruby `VALUE`s with no allocation until a clause
@@ -137,7 +139,8 @@ refers to the constructor; the type module is `::Person` or
 | `(a, b)`, `(a, b, c)`, `()`      | Ruby Arrays of exactly that length                         |
 | `True`, `False`                  | `true`, `false`                                            |
 | `0`, `-1`, `1.5`, `0xFF`, `12345678901234567890` | numbers (`0` also matches `0.0`, as in Haskell) |
-| `"text"`, `'c'`                  | Ruby Strings (a char literal is a one-character string)    |
+| `'c'`                            | a character: a one-character Ruby String, or one character of a String matched as a list |
+| `"text"`                         | the list `['t', 'e', 'x', 't']`: `String = [Char]`, so `f "" = ...; f (c:cs) = ...` works on Ruby Strings |
 | `:sym`, `:"quoted"`              | Ruby Symbols (an extension)                                |
 | `all@(x:_)`                      | as-pattern                                                 |
 | `~(a, b)`                        | lazy (irrefutable) pattern: always matches; destructured only when the clause runs |
@@ -145,6 +148,28 @@ refers to the constructor; the type module is `::Person` or
 | `Data.Maybe.Just x`              | qualification is ignored                                   |
 
 Comments (`-- ...`, `{- ... -}`) are allowed inside patterns.
+
+Ruby Strings are lists of characters wherever a list pattern appears: `[]`
+matches `""`, `(c:cs)` binds `c` to a one-character String and `cs` to the
+rest (a String), and `['y', _]` matches any two-character String starting
+with `y`. The same patterns match Arrays of one-character Strings. `Char` and
+`String` are different types, as in Haskell: `'a'` and `"a"` cannot appear in
+the same position.
+
+### Wildcards and run-time types
+
+`_` and variables match any value and never fail. Constructor and literal
+patterns fail on values of another type, which simply moves matching on to
+the next clause. Only when no pattern of the function can accept a value is
+`HaskellMatch::TypeMismatchError` raised, the run-time counterpart of the
+compile error Haskell would give:
+
+```ruby
+f = HaskellMatch.fn(:f) { on("Just x") { |x| x }; on("_") { :other } }
+f.(5)           # => :other           `_` accepts anything
+g = HaskellMatch.fn(:g) { on("Just x") { |x| x }; on("Nothing") { 0 } }
+g.(5)           # TypeMismatchError: expected a value of type Maybe but got 5 (Integer)
+```
 
 ### Guards
 
@@ -174,6 +199,33 @@ on("(x:xs)") { |*vals| vals }        # positional, pattern order
 ```
 
 Naming a parameter that the pattern does not bind is a `DefinitionError`.
+
+### Recursion
+
+A function is in scope inside its own clauses under its name, and as `recur`:
+
+```ruby
+fact = HaskellMatch.fn(:fact) do
+  on("0") { 1 }
+  on("n") { |n| n * fact.(n - 1) }         # or recur.(n - 1)
+end
+```
+
+Non-tail recursion uses Ruby's VM stack: each level costs a dispatch frame
+plus the body's frame, so the depth limit is about half that of an inlined
+Ruby lambda (roughly 6,000 levels with Ruby's default 1 MB VM stack; raise
+`RUBY_THREAD_VM_STACK_SIZE` to go deeper). Tail calls run in constant space,
+as Haskell loops do: return `function.tail(args...)` from a clause body and
+the call continues with those arguments without growing the stack, including
+between different functions:
+
+```ruby
+sum = HaskellMatch.fn(:sum) do
+  on("acc", "[]")     { |acc| acc }
+  on("acc", "(x:xs)") { |acc, x, xs| sum.tail(acc + x, xs) }
+end
+sum.(0, (1..1_000_000).to_a)   # => 500000500000
+```
 
 ### Clause bodies and `self`
 
@@ -264,9 +316,9 @@ types), `DuplicateVariableError`, `FieldError`, `DataDeclarationError`,
 `RedundantClauseError` (`#clauses` lists the indices), `DefinitionError`.
 
 Match time (`HaskellMatch::MatchError`): `MatchError` itself for a partial
-function with no matching clause, `TypeMismatchError` when an argument is not
-of the type the patterns expect (`expected a value of type Maybe but got 5
-(Integer)`), `IrrefutablePatternError` when a `~` pattern fails to
+function with no matching clause, `TypeMismatchError` when a value is of a
+type no pattern of the function can accept (`expected a value of type Maybe
+but got 5 (Integer)`), `IrrefutablePatternError` when a `~` pattern fails to
 destructure. Wrong argument counts raise `ArgumentError`.
 
 Exceptions raised in bodies and guards propagate unchanged, with their
@@ -289,9 +341,11 @@ backtraces; `throw`, `return` and `next` behave as in any block.
   Ractor.new(f) { |g| g.(Just.new(1)) }.take   # => 1
   ```
 
-  A recursive shareable function must refer to itself through a constant,
-  because the value of a captured local is fixed when the procs are made
-  shareable (and the function does not exist yet at that point).
+  Inside a shareable function, recursion goes through the function's name or
+  `recur` (the body's `self` is a module that knows the finished function).
+  Do not also keep the function in a local variable of the same name: the
+  variable would shadow the name, and `make_shareable` fixes a captured
+  local's value (still `nil` at that point).
 
 ## Performance
 

@@ -39,7 +39,10 @@ class ExhaustivenessTest < Minitest::Test
 
   def test_literal_witnesses
     assert_equal ["p1 where p1 is not one of {0, 1}"], missing_for { fn { on("0") { 1 }; on("1") { 2 } } }
-    assert_equal ["p1 where p1 is not one of {\"a\", \"b\"}"], missing_for { fn { on("\"a\"") { 1 }; on("\"b\"") { 2 } } }
+    assert_equal ["p1 where p1 is not one of {'a', 'b'}"], missing_for { fn { on("'a'") { 1 }; on("'b'") { 2 } } }
+    # a string literal is a list of characters
+    assert_equal ["[]", "['o']", "('o':'k':_:_)", "('o':p1:_) where p1 is not one of {'k'}", "(p1:_) where p1 is not one of {'o'}"],
+                 missing_for { fn { on("\"ok\"") { 1 }; on("(c:cs)", guard: ->(c) { c == "x" }) { 2 } } }
     assert_equal ["p1 where p1 is not one of {:ok}"], missing_for { fn { on(":ok") { 1 } } }
     assert_equal ["Just p1 where p1 is not one of {0}"], missing_for { fn { on("Just 0") { 1 }; on("Nothing") { 2 } } }
     assert_equal ["(p1, p2) where p1 is not one of {0} and p2 is not one of {1}"],

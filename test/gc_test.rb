@@ -18,6 +18,7 @@ class GcTest < Minitest::Test
         assert_equal 45, sum.((1..9).map { |i| i.to_s.to_i })
         assert_equal ["a" * 20, "b" * 20, "c" * 20], walk.(tree)
         assert_equal({ x: "q" * 30 }, HaskellMatch.pattern("Just x").match(Just.new("q" * 30)))
+        assert_equal({ c: "q", cs: "q" * 29 }, HaskellMatch.pattern("(c:cs)").match("q" * 30))
       end
     ensure
       GC.stress = false
@@ -37,11 +38,11 @@ class GcTest < Minitest::Test
   end
 
   def test_literal_objects_are_kept_alive
-    f = fn { on("(\"#{'k' * 40}\", 1234567890123456789012345, 2.5, :sym)") { :all }; on("_") { :other } }
+    f = fn { on("('k', 1234567890123456789012345, 2.5, :sym, \"é\")") { :all }; on("_") { :other } }
     GC.start(full_mark: true, immediate_sweep: true)
     GC.compact if GC.respond_to?(:compact)
-    assert_equal :all, f.(["k" * 40, 1_234_567_890_123_456_789_012_345, 2.5, :sym])
-    assert_equal :other, f.(["z", 1, 2.5, :sym])
+    assert_equal :all, f.(["k", 1_234_567_890_123_456_789_012_345, 2.5, :sym, "é"])
+    assert_equal :other, f.(["z", 1, 2.5, :sym, "é"])
   end
 
   def test_bound_tails_survive_allocation_in_body

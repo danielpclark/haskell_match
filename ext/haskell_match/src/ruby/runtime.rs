@@ -17,17 +17,45 @@ use crate::core::ast::{Lit, LitKey, LitKind, Pat};
 use crate::core::tree::{BindSrc, LazyPat, Leaf, Tree};
 use crate::core::types::{TypeEnv, TypeId, TypeKind};
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SlotKind {
+    /// An ordinary Ruby value.
+    Plain,
+    /// A list view: elements `off..` of the Array or String in `v`.
+    View,
+    /// Character `off` of the String in `v` (a list head not yet
+    /// materialised as a one-character String).
+    Char,
+}
+
 #[derive(Clone, Copy)]
 pub struct Slot {
     pub v: Value,
-    /// Offset into `v` when it is a list view; otherwise 0.
     pub off: i64,
+    pub kind: SlotKind,
 }
 
 impl Slot {
+    #[inline]
     fn plain(v: Value) -> Slot {
-        Slot { v, off: 0 }
+        Slot {
+            v,
+            off: 0,
+            kind: SlotKind::Plain,
+        }
     }
+    #[inline]
+    fn empty() -> Slot {
+        Slot::plain(Value::from(0))
+    }
+}
+
+extern "C" {
+    fn rb_str_substr(
+        string: Value,
+        begin: std::os::raw::c_long,
+        len: std::os::raw::c_long,
+    ) -> Value;
 }
 
 pub struct RtCase {
@@ -140,8 +168,8 @@ pub fn literal_object(l: &Lit) -> Value {
             unsafe { rutie::rubysys::numeric::rb_cstr_to_inum(cs.as_ptr(), 10, 1) }
         }
         Lit::Float(f) => rutie::Float::new(*f).value(),
-        Lit::Str(s) => unsafe {
-            rutie::rubysys::string::rb_str_freeze(rutie::RString::new_utf8(s).value())
+        Lit::Char(c) => unsafe {
+            rutie::rubysys::string::rb_str_freeze(rutie::RString::new_utf8(&c.to_string()).value())
         },
         Lit::Sym(s) => rutie::Symbol::new(s).value(),
     };
@@ -209,17 +237,36 @@ fn is_array(v: Value) -> bool {
 }
 
 #[inline]
+fn is_string(v: Value) -> bool {
+    v.ty() == ValueType::RString
+}
+
+#[inline]
 fn truthy(v: Value) -> bool {
     !(v.is_nil() || v.is_false())
 }
 
-/// Identify the constructor of `slot` for type `ty`: `Ok(Some((tag, fields)))`
-/// when it is a value of the type (fields pushed into `out`), `Ok(None)` when
-/// it is not.
+/// Number of elements of a list view: Arrays and Strings (`String = [Char]`).
+#[inline]
+unsafe fn list_len(slot: Slot) -> Option<i64> {
+    if is_array(slot.v) {
+        Some(ary_len(slot.v) - slot.off)
+    } else if is_string(slot.v) && slot.kind != SlotKind::Char {
+        Some(rutie::rubysys::string::rb_str_strlen(slot.v) as i64 - slot.off)
+    } else {
+        None
+    }
+}
+
+/// Identify the constructor (by tag) of `slot` for type `ty`; `None` when the
+/// value is not of that type at all.
 #[inline]
 unsafe fn identify(env: &TypeEnv, ty: TypeId, slot: Slot) -> Option<usize> {
     match env.ty(ty).kind {
         TypeKind::Adt => {
+            if slot.kind != SlotKind::Plain {
+                return None;
+            }
             let klass = class::rb_obj_class(slot.v).value;
             let dt = env.ty(ty);
             for &c in &dt.cons {
@@ -230,7 +277,9 @@ unsafe fn identify(env: &TypeEnv, ty: TypeId, slot: Slot) -> Option<usize> {
             None
         }
         TypeKind::Bool => {
-            if slot.v.is_true() {
+            if slot.kind != SlotKind::Plain {
+                None
+            } else if slot.v.is_true() {
                 Some(1)
             } else if slot.v.is_false() {
                 Some(0)
@@ -238,18 +287,12 @@ unsafe fn identify(env: &TypeEnv, ty: TypeId, slot: Slot) -> Option<usize> {
                 None
             }
         }
-        TypeKind::List => {
-            if !is_array(slot.v) {
-                return None;
-            }
-            if ary_len(slot.v) - slot.off == 0 {
-                Some(0)
-            } else {
-                Some(1)
-            }
-        }
+        TypeKind::List => list_len(slot).map(|n| if n == 0 { 0 } else { 1 }),
         TypeKind::Tuple(n) => {
-            if is_array(slot.v) && (ary_len(slot.v) - slot.off) as usize == n {
+            if slot.kind != SlotKind::Char
+                && is_array(slot.v)
+                && (ary_len(slot.v) - slot.off) as usize == n
+            {
                 Some(0)
             } else {
                 None
@@ -278,10 +321,19 @@ unsafe fn fields_into(
         TypeKind::Bool => {}
         TypeKind::List => {
             if arity == 2 {
-                slots[base] = Slot::plain(array::rb_ary_entry(slot.v, slot.off as _));
+                slots[base] = if is_array(slot.v) {
+                    Slot::plain(array::rb_ary_entry(slot.v, slot.off as _))
+                } else {
+                    Slot {
+                        v: slot.v,
+                        off: slot.off,
+                        kind: SlotKind::Char,
+                    }
+                };
                 slots[base + 1] = Slot {
                     v: slot.v,
                     off: slot.off + 1,
+                    kind: SlotKind::View,
                 };
             }
         }
@@ -297,23 +349,46 @@ unsafe fn fields_into(
 /// Turn a slot into the Ruby object a variable bound to it should see.
 #[inline]
 unsafe fn materialize(slot: Slot) -> Value {
-    if slot.off == 0 {
-        slot.v
-    } else {
-        let len = ary_len(slot.v) - slot.off;
-        array::rb_ary_subseq(slot.v, slot.off as _, len.max(0) as _)
+    match slot.kind {
+        SlotKind::Plain => slot.v,
+        SlotKind::View => {
+            if slot.off == 0 {
+                slot.v
+            } else if is_array(slot.v) {
+                let len = ary_len(slot.v) - slot.off;
+                array::rb_ary_subseq(slot.v, slot.off as _, len.max(0) as _)
+            } else {
+                let len = rutie::rubysys::string::rb_str_strlen(slot.v) as i64 - slot.off;
+                rb_str_substr(slot.v, slot.off as _, len.max(0) as _)
+            }
+        }
+        SlotKind::Char => rb_str_substr(slot.v, slot.off as _, 1),
     }
 }
 
-unsafe fn lit_matches(kind: LitKind, case: &RtLitCase, v: Value) -> bool {
+/// The character at `off` of an ASCII-only string, without allocating.
+#[inline]
+unsafe fn ascii_char_at(v: Value, off: i64) -> Option<u8> {
+    if rutie::rubysys::string::rb_enc_str_asciionly_p(v) == 0 {
+        return None;
+    }
+    let len = rutie::rubysys::string::rstring_len(v) as i64;
+    if off < 0 || off >= len {
+        return None;
+    }
+    let ptr = rutie::rubysys::string::rb_string_value_ptr(&v) as *const u8;
+    Some(*ptr.add(off as usize))
+}
+
+unsafe fn lit_matches(kind: LitKind, case: &RtLitCase, slot: Slot) -> bool {
     match kind {
         LitKind::Num => {
+            let v = slot.v;
             if v.is_fixnum() {
                 let i = (v.value as i64) >> 1;
                 return match case.lit {
                     Lit::Int(j) => i == j,
                     Lit::Float(f) => (i as f64) == f,
-                    Lit::Big(_) => false,
                     _ => false,
                 };
             }
@@ -328,21 +403,38 @@ unsafe fn lit_matches(kind: LitKind, case: &RtLitCase, v: Value) -> bool {
             }
             class::rb_equal(v, case.obj).is_true()
         }
-        LitKind::Str => rutie::rubysys::string::rb_str_equal(v, case.obj).is_true(),
-        LitKind::Sym => v.value == case.obj.value,
+        LitKind::Char => {
+            let want = match case.lit {
+                Lit::Char(c) => c,
+                _ => return false,
+            };
+            if slot.kind == SlotKind::Char {
+                if let Some(b) = ascii_char_at(slot.v, slot.off) {
+                    return want.is_ascii() && b == want as u8;
+                }
+            }
+            rutie::rubysys::string::rb_str_equal(materialize(slot), case.obj).is_true()
+        }
+        LitKind::Sym => slot.v.value == case.obj.value,
     }
 }
 
-unsafe fn lit_kind_ok(kind: LitKind, v: Value) -> bool {
+unsafe fn lit_kind_ok(kind: LitKind, slot: Slot) -> bool {
     match kind {
         LitKind::Num => {
-            v.is_fixnum()
-                || v.is_flonum()
-                || matches!(v.ty(), ValueType::Float | ValueType::Bignum)
-                || class::rb_obj_is_kind_of(v, rutie::rubysys::builtins::rb_cNumeric).is_true()
+            let v = slot.v;
+            slot.kind == SlotKind::Plain
+                && (v.is_fixnum()
+                    || v.is_flonum()
+                    || matches!(v.ty(), ValueType::Float | ValueType::Bignum)
+                    || class::rb_obj_is_kind_of(v, rutie::rubysys::builtins::rb_cNumeric).is_true())
         }
-        LitKind::Str => v.ty() == ValueType::RString,
-        LitKind::Sym => v.is_symbol() || v.ty() == ValueType::Symbol,
+        LitKind::Char => {
+            slot.kind == SlotKind::Char || (slot.kind == SlotKind::Plain && is_string(slot.v))
+        }
+        LitKind::Sym => {
+            slot.kind == SlotKind::Plain && (slot.v.is_symbol() || slot.v.ty() == ValueType::Symbol)
+        }
     }
 }
 
@@ -423,21 +515,12 @@ impl Matcher {
                 got: args.len(),
             });
         }
-        let mut stack = [Slot {
-            v: Value::from(0),
-            off: 0,
-        }; 32];
+        let mut stack = [Slot::empty(); 32];
         let mut heap: Vec<Slot> = Vec::new();
         let slots: &mut [Slot] = if self.n_slots <= 32 {
             &mut stack[..self.n_slots.max(1)]
         } else {
-            heap.resize(
-                self.n_slots,
-                Slot {
-                    v: Value::from(0),
-                    off: 0,
-                },
-            );
+            heap.resize(self.n_slots, Slot::empty());
             &mut heap[..]
         };
         for (slot, arg) in slots.iter_mut().zip(args.iter()) {
@@ -477,35 +560,29 @@ impl Matcher {
                     default,
                 } => {
                     let s = slots[*slot];
-                    let tag = match identify(&self.env, *ty, s) {
-                        Some(t) => t,
-                        None => {
-                            return Err(RtError::TypeMismatch {
-                                expected: self.type_name(*ty),
-                                got: materialize(s),
-                            })
-                        }
-                    };
-                    let mut found = None;
-                    for c in cases {
-                        if c.tag == tag {
-                            found = Some(c);
-                            break;
-                        }
-                    }
-                    match found {
-                        Some(c) => {
-                            fields_into(&self.env, *ty, s, c.arity, c.base, slots);
-                            node = &c.tree;
-                        }
+                    // A value that is not of this type matches no constructor
+                    // pattern; wildcard rows (the default branch) still
+                    // accept it, as `_` accepts anything in Haskell.  Without
+                    // such rows no clause could ever match it: report the
+                    // type error Haskell would have found statically.
+                    match identify(&self.env, *ty, s) {
+                        Some(tag) => match cases.iter().find(|c| c.tag == tag) {
+                            Some(c) => {
+                                fields_into(&self.env, *ty, s, c.arity, c.base, slots);
+                                node = &c.tree;
+                            }
+                            None => match default {
+                                Some(d) => node = d,
+                                None => return Err(RtError::NoMatch),
+                            },
+                        },
                         None => match default {
-                            Some(d) => node = d,
-                            None => {
-                                // complete signature: every tag has a case
+                            Some(d) if !matches!(**d, RtTree::Fail) => node = d,
+                            _ => {
                                 return Err(RtError::TypeMismatch {
                                     expected: self.type_name(*ty),
                                     got: materialize(s),
-                                });
+                                })
                             }
                         },
                     }
@@ -517,16 +594,19 @@ impl Matcher {
                     default,
                 } => {
                     let s = slots[*slot];
-                    let v = materialize(s);
-                    if !lit_kind_ok(*kind, v) {
-                        return Err(RtError::TypeMismatch {
-                            expected: kind.name().to_string(),
-                            got: v,
-                        });
+                    if !lit_kind_ok(*kind, s) {
+                        if matches!(**default, RtTree::Fail) {
+                            return Err(RtError::TypeMismatch {
+                                expected: kind.name().to_string(),
+                                got: materialize(s),
+                            });
+                        }
+                        node = default;
+                        continue;
                     }
                     let mut next: &RtTree = default;
                     for c in cases {
-                        if lit_matches(*kind, c, v) {
+                        if lit_matches(*kind, c, s) {
                             next = &c.tree;
                             break;
                         }
@@ -606,9 +686,8 @@ impl Matcher {
             }
             Pat::Lazy(inner) => self.destructure(inner, slot, store),
             Pat::Lit(l) => {
-                let v = materialize(slot);
                 let kind = l.kind();
-                if !lit_kind_ok(kind, v) {
+                if !lit_kind_ok(kind, slot) {
                     return false;
                 }
                 let obj = match self.lazy_lits.get(&l.key()) {
@@ -620,20 +699,14 @@ impl Matcher {
                     obj,
                     tree: RtTree::Fail,
                 };
-                lit_matches(kind, &case, v)
+                lit_matches(kind, &case, slot)
             }
             Pat::Con(c, args) => {
                 let con = self.env.con(*c);
                 let ty = con.ty;
                 match identify(&self.env, ty, slot) {
                     Some(tag) if tag == con.tag => {
-                        let mut tmp = vec![
-                            Slot {
-                                v: Value::from(0),
-                                off: 0
-                            };
-                            con.arity
-                        ];
+                        let mut tmp = vec![Slot::empty(); con.arity];
                         fields_into(&self.env, ty, slot, con.arity, 0, &mut tmp);
                         args.iter()
                             .zip(tmp.iter())

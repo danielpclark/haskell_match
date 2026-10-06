@@ -8,8 +8,19 @@ module HaskellMatch
   #     on("(_:xs)") { |xs| 1 + length.(xs) }
   #   end
   #   length.([1, 2, 3])  # => 3
+  # Returned by {Function#tail}: tells the native `call` to continue with
+  # `function` applied to `args` instead of growing the stack.
+  TailCall = Data.define(:function, :args)
+
   class Function < Native::Matcher
     attr_reader :clauses
+
+    # Request a tail call: `recur.tail(n - 1, acc * n)` as the last
+    # expression of a clause body re-enters the function (or any other
+    # function) in constant stack space, like a tail call in Haskell.
+    def tail(*args)
+      TailCall.new(self, args)
+    end
 
     # Build a function from clauses (use {HaskellMatch.fn}).  The native
     # `new` compiles the patterns; the clause bodies and guards are then
@@ -19,17 +30,20 @@ module HaskellMatch
     # (`Ractor.make_shareable`), as is the function, so it can be sent to and
     # called from other Ractors.  In that mode the definition block cannot
     # call methods of the surrounding object, and local variables captured
-    # by the bodies must already be shareable.
-    def self.define(name, clauses, exhaustive:, overlapping:, ractor: false)
-      clauses = rebind_for_ractor(clauses) if ractor
+    # by the bodies must already be shareable; recursion goes through the
+    # function's name or `recur`, which work in both modes.
+    def self.define(name, builder, exhaustive:, overlapping:, ractor: false)
+      clauses = builder.clauses
+      clauses = make_shareable(clauses) if ractor
       f, bodies, guards = Compiler.compile(name.to_s, clauses, exhaustive: exhaustive,
                                                              overlapping: overlapping, klass: self)
       f.send(:attach, clauses, bodies, guards)
+      builder.define_function(f, name.to_s)
       Ractor.make_shareable(f) if ractor
       f
     end
 
-    def self.rebind_for_ractor(clauses)
+    def self.make_shareable(clauses)
       raise DefinitionError, "ractor: true requires Ractor support in this Ruby" unless defined?(Ractor)
 
       clauses.map do |c|
@@ -42,7 +56,7 @@ module HaskellMatch
         Clause.new(c.patterns, guard, body, c.location)
       end
     end
-    private_class_method :rebind_for_ractor
+    private_class_method :make_shareable
 
     # call(*args) is native; these aliases make a Function behave like a Proc.
     alias [] call
@@ -119,9 +133,9 @@ module HaskellMatch
     def fn(name = nil, exhaustive: self.exhaustive, overlapping: self.overlapping, ractor: false, &definition)
       raise ArgumentError, "HaskellMatch.fn needs a block with on(...) clauses" unless definition
 
-      clauses = ClauseBuilder.collect(definition, ractor: ractor)
+      builder = ClauseBuilder.collect(definition, ractor: ractor)
       name ||= "anonymous function at #{definition.source_location&.join(':')}"
-      Function.define(name, clauses, exhaustive: exhaustive, overlapping: overlapping, ractor: ractor)
+      Function.define(name, builder, exhaustive: exhaustive, overlapping: overlapping, ractor: ractor)
     end
   end
 end

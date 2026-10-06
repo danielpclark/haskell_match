@@ -366,6 +366,13 @@ pub mod interp {
                     Some((1, vec![items[0].clone(), Val::List(items[1..].to_vec())]))
                 }
             }
+            (TypeKind::List, Val::Str(s)) => {
+                let mut chars = s.chars();
+                match chars.next() {
+                    None => Some((0, vec![])),
+                    Some(c) => Some((1, vec![Val::Str(c.to_string()), Val::Str(chars.collect())])),
+                }
+            }
             (TypeKind::Tuple(n), Val::Tuple(items)) if items.len() == n => Some((0, items.clone())),
             _ => None,
         }
@@ -374,7 +381,7 @@ pub mod interp {
     fn lit_eq(l: &Lit, v: &Val) -> bool {
         match (l, v) {
             (Lit::Int(i), Val::Int(j)) => i == j,
-            (Lit::Str(s), Val::Str(t)) => s == t,
+            (Lit::Char(c), Val::Str(t)) => t.chars().count() == 1 && t.starts_with(*c),
             _ => false,
         }
     }
@@ -382,7 +389,7 @@ pub mod interp {
     fn lit_kind_ok(k: LitKind, v: &Val) -> bool {
         matches!(
             (k, v),
-            (LitKind::Num, Val::Int(_)) | (LitKind::Str, Val::Str(_))
+            (LitKind::Num, Val::Int(_)) | (LitKind::Char, Val::Str(_))
         )
     }
 

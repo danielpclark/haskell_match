@@ -27,42 +27,6 @@ module HaskellMatch
       @owner = owner
     end
 
-    def method_missing(name, *args, **kwargs, &blk)
-      if @owner && @owner.respond_to?(name, true)
-        @owner.__send__(name, *args, **kwargs, &blk)
-      else
-        super
-      end
-    end
-
-    def respond_to_missing?(name, include_private = false)
-      (@owner && @owner.respond_to?(name, include_private)) || super
-    end
-
-    # Run a definition block: instance_exec'd on the builder when it takes no
-    # parameters, otherwise called with the builder as its argument.
-    #
-    # In `ractor` mode the builder has no owner to forward to, and is frozen
-    # and emptied once the clauses are collected, so the clause procs (whose
-    # `self` it is) can be passed to `Ractor.make_shareable`.
-    def self.collect(definition, ractor: false)
-      builder = new(ractor ? nil : definition.binding.receiver)
-      if definition.arity.zero?
-        builder.instance_exec(&definition)
-      else
-        definition.call(builder)
-      end
-      clauses = builder.clauses
-      builder.detach! if ractor
-      clauses
-    end
-
-    def detach!
-      @clauses = nil
-      @owner = nil
-      freeze
-    end
-
     # Add a clause.  Patterns are Haskell pattern strings, one per argument.
     def on(*patterns, guard: nil, where: nil, &body)
       guard ||= where
@@ -87,6 +51,102 @@ module HaskellMatch
     end
 
     OTHERWISE = ->(*) { true }.freeze
+
+    # The function being defined, for recursion from inside its own clause
+    # bodies (also reachable under the function's own name).
+    def recur
+      @function or raise DefinitionError, "the function is not defined yet"
+    end
+    alias this recur
+
+    def method_missing(name, *args, **kwargs, &blk)
+      if @owner && @owner.respond_to?(name, true)
+        @owner.__send__(name, *args, **kwargs, &blk)
+      else
+        super
+      end
+    end
+
+    def respond_to_missing?(name, include_private = false)
+      (@owner && @owner.respond_to?(name, include_private)) || super
+    end
+
+    # Run a definition block: instance_exec'd on the builder when it takes no
+    # parameters, otherwise called with the builder as its argument.  Returns
+    # the builder; call {#define_function} once the function exists so clause
+    # bodies can recurse through `recur` or the function's name.
+    def self.collect(definition, ractor: false)
+      builder = ractor ? RactorHost.new_builder : new(definition.binding.receiver)
+      if definition.arity.zero?
+        builder.instance_exec(&definition)
+      else
+        definition.call(builder)
+      end
+      builder
+    end
+
+    NAME_PATTERN = /\A[a-z_][A-Za-z0-9_]*[?!]?\z/
+
+    # Make the finished function reachable from its clause bodies as `recur`
+    # and, when the name is a valid method name, as `name`.
+    def define_function(function, name)
+      @function = function
+      return unless name.is_a?(String) && name.match?(NAME_PATTERN) && !respond_to?(name, true)
+
+      define_singleton_method(name) { function }
+    end
+
+    # Clause-builder behaviour for Ractor-shareable functions.  A Module is
+    # used as the builder (and so as `self` of the clause bodies) because
+    # modules are always shareable while remaining open for a constant that
+    # points back at the finished function.
+    module RactorHost
+      def self.new_builder
+        host = Module.new
+        host.extend(RactorHost)
+        host.instance_variable_set(:@clauses, [])
+        host
+      end
+
+      def clauses
+        @clauses
+      end
+
+      def on(*patterns, guard: nil, where: nil, &body)
+        guard ||= where
+        raise DefinitionError, "a clause needs at least one pattern" if patterns.empty?
+        raise DefinitionError, "a clause needs a body block" unless body
+        if guard && !guard.respond_to?(:call)
+          raise DefinitionError, "guard must be callable (a Proc or lambda)"
+        end
+
+        patterns.each do |p|
+          raise DefinitionError, "patterns must be Strings, got #{p.inspect}" unless p.is_a?(String)
+        end
+        @clauses << Clause.new(patterns.map(&:dup).each(&:freeze).freeze, guard, body, body.source_location)
+        self
+      end
+      alias clause on
+      alias _ on
+
+      def otherwise
+        OTHERWISE
+      end
+
+      # Constant lookup is the Ractor-safe way back to the function.
+      def recur
+        const_get(:FUNCTION)
+      end
+      alias this recur
+
+      def define_function(function, name)
+        const_set(:FUNCTION, function)
+        return unless name.is_a?(String) && name.match?(NAME_PATTERN) && !respond_to?(name, true)
+
+        host = self
+        define_singleton_method(name, &Ractor.make_shareable(-> { host.const_get(:FUNCTION) }))
+      end
+    end
   end
 
   # Compiles clauses into a native matcher and enforces exhaustiveness and

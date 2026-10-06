@@ -11,7 +11,8 @@
 //!          | '~' apat | '!' apat                  -- lazy / bang
 //!          | ConId                                -- nullary constructor
 //!          | ConId '{' fpat, ... [..] '}'         -- record pattern
-//!          | literal                              -- 1  1.5  "s"  'c'  :sym
+//!          | literal                              -- 1  1.5  'c'  :sym
+//!          | string                               -- "abc" = ['a', 'b', 'c']
 //!          | '_'
 //!          | '(' ')' | '(' pattern ')' | '(' pattern ',' pattern ... ')'
 //!          | '[' ']' | '[' pattern ',' ... ']'
@@ -259,8 +260,13 @@ fn apat(p: &mut P) -> Result<RawPat> {
                 .map_err(|_| p.err(format!("malformed float literal {}", s)))?;
             Ok(RawPat::Lit(float_lit(f)))
         }
-        Tok::Str(s) => Ok(RawPat::Lit(Lit::Str(s))),
-        Tok::Char(s) => Ok(RawPat::Lit(Lit::Str(s))),
+        // `"abc"` is `['a', 'b', 'c']`, as `String = [Char]` in Haskell
+        Tok::Str(s) => Ok(RawPat::List(
+            s.chars().map(|c| RawPat::Lit(Lit::Char(c))).collect(),
+        )),
+        Tok::Char(s) => Ok(RawPat::Lit(Lit::Char(
+            s.chars().next().expect("lexer checked length"),
+        ))),
         Tok::Sym(s) => Ok(RawPat::Lit(Lit::Sym(s))),
         Tok::LParen => {
             if p.peek() == Some(&Tok::RParen) {
@@ -703,12 +709,10 @@ mod tests {
         assert_eq!(parse_pattern("2.0").unwrap(), Lit(super::Lit::Int(2)));
         assert_eq!(
             parse_pattern("\"hi\"").unwrap(),
-            Lit(super::Lit::Str("hi".into()))
+            List(vec![Lit(super::Lit::Char('h')), Lit(super::Lit::Char('i'))])
         );
-        assert_eq!(
-            parse_pattern("'c'").unwrap(),
-            Lit(super::Lit::Str("c".into()))
-        );
+        assert_eq!(parse_pattern("\"\"").unwrap(), List(vec![]));
+        assert_eq!(parse_pattern("'c'").unwrap(), Lit(super::Lit::Char('c')));
         assert_eq!(
             parse_pattern(":ok").unwrap(),
             Lit(super::Lit::Sym("ok".into()))

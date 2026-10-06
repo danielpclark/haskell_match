@@ -8,13 +8,16 @@
 use std::fmt;
 
 /// Literal patterns.  Integer literals that do not fit in an `i64` are kept as
-/// their canonical decimal text in `Big`.
+/// their canonical decimal text in `Big`.  There is no string literal: as in
+/// Haskell, `"abc"` is the list `['a', 'b', 'c']` and is desugared by the
+/// parser; `Char` holds one character (matched against a one-character Ruby
+/// String, or a character of a String viewed as a list).
 #[derive(Clone, Debug, PartialEq)]
 pub enum Lit {
     Int(i64),
     Big(String),
     Float(f64),
-    Str(String),
+    Char(char),
     Sym(String),
 }
 
@@ -25,7 +28,7 @@ pub enum LitKey {
     Int(i64),
     Big(String),
     Float(u64),
-    Str(String),
+    Char(char),
     Sym(String),
 }
 
@@ -35,7 +38,7 @@ pub enum LitKey {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum LitKind {
     Num,
-    Str,
+    Char,
     Sym,
 }
 
@@ -43,7 +46,7 @@ impl LitKind {
     pub fn name(self) -> &'static str {
         match self {
             LitKind::Num => "Num",
-            LitKind::Str => "String",
+            LitKind::Char => "Char",
             LitKind::Sym => "Symbol",
         }
     }
@@ -58,7 +61,7 @@ impl Lit {
                 let f = if *f == 0.0 { 0.0 } else { *f };
                 LitKey::Float(f.to_bits())
             }
-            Lit::Str(s) => LitKey::Str(s.clone()),
+            Lit::Char(c) => LitKey::Char(*c),
             Lit::Sym(s) => LitKey::Sym(s.clone()),
         }
     }
@@ -66,7 +69,7 @@ impl Lit {
     pub fn kind(&self) -> LitKind {
         match self {
             Lit::Int(_) | Lit::Big(_) | Lit::Float(_) => LitKind::Num,
-            Lit::Str(_) => LitKind::Str,
+            Lit::Char(_) => LitKind::Char,
             Lit::Sym(_) => LitKind::Sym,
         }
     }
@@ -88,7 +91,7 @@ impl fmt::Display for Lit {
                     write!(f, "{}", x)
                 }
             }
-            Lit::Str(s) => write!(f, "{:?}", s),
+            Lit::Char(c) => write!(f, "{:?}", c),
             Lit::Sym(s) => write!(f, ":{}", s),
         }
     }

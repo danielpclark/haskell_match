@@ -87,8 +87,7 @@ class FunctionTest < Minitest::Test
     f = fn(:not) { on("True") { false }; on("False") { true } }
     assert_equal false, f.(true)
     assert_equal true, f.(false)
-    err = assert_raises(HaskellMatch::TypeMismatchError) { f.(nil) }
-    assert_includes err.message, "expected a value of type Bool but got nil (NilClass)"
+    assert_raises(HaskellMatch::TypeMismatchError) { f.(nil) }
     assert_raises(HaskellMatch::TypeMismatchError) { f.(1) }
     both = fn(:and) do
       on("True", "True") { true }
@@ -130,39 +129,106 @@ class FunctionTest < Minitest::Test
     assert_equal :two, fl.(2.0)
     assert_equal :two, fl.(Rational(2, 1))
     assert_equal :other, fl.(2.1)
-    assert_raises(HaskellMatch::TypeMismatchError) { fl.("2") }
+    assert_equal :other, fl.("2") # `_` accepts anything
   end
 
-  def test_string_char_and_symbol_literals
-    greet = fn(:greet) do
+  def test_strings_are_lists_of_characters
+    # String = [Char]: list patterns destructure Ruby Strings
+    f = fn(:f) do
+      on("\"\"") { :empty }
       on("\"hello\"") { :hi }
-      on("'x'") { :char_x }
       on("\"\\n\"") { :newline }
-      on("other") { |other| other }
+      on("['y', _]") { :y_then_one }
+      on("(c:cs)") { |c, cs| [c, cs] }
     end
-    assert_equal :hi, greet.("hello")
-    assert_equal :char_x, greet.("x")
-    assert_equal :newline, greet.("\n")
-    assert_equal "zzz", greet.("zzz")
-    assert_equal :hi, greet.("hello".b)
-    assert_raises(HaskellMatch::TypeMismatchError) { greet.(:hello) }
+    assert_equal :empty, f.("")
+    assert_equal :hi, f.("hello")
+    assert_equal :hi, f.("hello".b)
+    assert_equal :newline, f.("\n")
+    assert_equal :y_then_one, f.("yx")
+    assert_equal ["h", "ey"], f.("hey")
+    assert_equal ["h", ""], f.("h")
+    assert_equal ["é", "té"], f.("été")
+    # the same patterns work on arrays of one-character strings
+    assert_equal :hi, f.(%w[h e l l o])
+    assert_equal :empty, f.([])
+    assert_equal [1, [2]], f.([1, 2])
+    # a tail bound from a string is a String, independent of the original
+    tail = f.("abc")[1]
+    assert_equal "bc", tail
+    tail << "!"
+    assert_equal "bc!", tail
+  end
 
+  def test_char_literals
+    g = fn(:g) { on("'x'") { :x }; on("'é'") { :e_acute }; on("c") { |c| c } }
+    assert_equal :x, g.("x")
+    assert_equal :e_acute, g.("é")
+    assert_equal "xy", g.("xy")
+    # Char and String are different types, as in Haskell
+    assert_raises(HaskellMatch::PatternTypeError) { fn { on("'x'") { 1 }; on("\"x\"") { 2 } } }
+    initial = fn(:initial) { on("('a':_)") { :a }; on("('b':_)") { :b }; on("_") { :other } }
+    assert_equal :a, initial.("apple")
+    assert_equal :b, initial.("banana")
+    assert_equal :other, initial.("cherry")
+    assert_equal :other, initial.("")
+  end
+
+  def test_symbol_literals
     sym = fn(:sym) { on(":ok") { 1 }; on(":error") { 2 }; on(":\"with space\"") { 3 }; on("_") { 0 } }
     assert_equal 1, sym.(:ok)
     assert_equal 2, sym.(:error)
     assert_equal 3, sym.(:"with space")
     assert_equal 0, sym.(:other)
     assert_equal 1, sym.("ok".to_sym)
-    assert_raises(HaskellMatch::TypeMismatchError) { sym.("ok") }
+    # `_` matches anything, so a String simply takes the wildcard clause
+    assert_equal 0, sym.("ok")
+    only = fn(:only, exhaustive: false) { on(":ok") { 1 } }
+    assert_raises(HaskellMatch::TypeMismatchError) { only.("ok") }
   end
 
-  def test_numeric_literal_type_mismatch
-    f = fn { on("0") { :zero }; on("_") { :other } }
-    assert_equal :other, f.(Rational(1, 3))
-    assert_equal :other, f.(10**30)
-    err = assert_raises(HaskellMatch::TypeMismatchError) { f.("0") }
-    assert_includes err.message, "expected a value of type Num"
+  def test_wildcards_match_anything
+    # Haskell's `_` and variables never fail to match.
+    f = fn { on("Just x") { |x| x }; on("_") { :other } }
+    assert_equal :other, f.(Nothing)
+    assert_equal :other, f.(5)
+    assert_equal :other, f.(nil)
+    assert_equal :other, f.([1])
+    g = fn { on("0") { :zero }; on("n") { |n| n } }
+    assert_equal "0", g.("0")
+    assert_nil g.(nil)
+    assert_equal Rational(1, 3), g.(Rational(1, 3))
+    h = fn { on("True") { 1 }; on("_") { 2 } }
+    assert_equal 2, h.(nil)
+    # (a clause after `[]` and `(x:_)` would be redundant, as in Haskell)
+    k = fn { on("[]") { :nil }; on("(x:_)") { |x| x } }
+    assert_equal :nil, k.("")
+    assert_equal 1, k.([1])
+    assert_raises(HaskellMatch::TypeMismatchError) { k.({ a: 1 }) }
+  end
+
+  def test_type_mismatch_when_no_pattern_can_accept_the_value
+    # Haskell rejects these calls at compile time; here the error is raised
+    # when a value matches none of the patterns and no wildcard remains.
+    f = fn { on("Just x") { |x| x }; on("Nothing") { 0 } }
+    err = assert_raises(HaskellMatch::TypeMismatchError) { f.(5) }
+    assert_includes err.message, "expected a value of type Maybe but got 5 (Integer)"
     assert_raises(HaskellMatch::TypeMismatchError) { f.(nil) }
+    assert_raises(HaskellMatch::TypeMismatchError) { f.(Just) }
+    assert_raises(HaskellMatch::TypeMismatchError) { f.(Left.new(1)) }
+    b = fn { on("True") { 1 }; on("False") { 0 } }
+    err = assert_raises(HaskellMatch::TypeMismatchError) { b.(nil) }
+    assert_includes err.message, "expected a value of type Bool but got nil (NilClass)"
+    n = fn(exhaustive: false) { on("0") { :zero }; on("1") { :one } }
+    err = assert_raises(HaskellMatch::TypeMismatchError) { n.("0") }
+    assert_includes err.message, "expected a value of type Num"
+    assert_raises(HaskellMatch::MatchError) { n.(2) }
+    l = fn(exhaustive: false) { on("(x:_)") { |x| x } }
+    assert_raises(HaskellMatch::TypeMismatchError) { l.(5) }
+    assert_raises(HaskellMatch::MatchError) { l.([]) }
+    # a wrong-typed value nested inside a well-typed one
+    d = fn { on("Just (Just x)") { |x| x }; on("Just Nothing") { 0 }; on("Nothing") { -1 } }
+    assert_raises(HaskellMatch::TypeMismatchError) { d.(Just.new(5)) }
   end
 
   def test_nested_patterns
@@ -390,6 +456,69 @@ class FunctionTest < Minitest::Test
   def test_recursion_depth
     count = fn(:count) { on("[]") { 0 }; on("(_:xs)") { |xs| 1 + count.(xs) } }
     assert_equal 2000, count.((1..2000).to_a)
+    # Each level is a dispatch frame plus the body's frame on Ruby's VM
+    # stack, the same shape as Ruby code that reaches the recursive call
+    # through a yielding helper; the depth matches that shape.
+    ruby_count = ->(xs) { xs.empty? ? 0 : 1 + dispatch { ruby_count.(xs[1..]) } }
+    ruby_limit = probe_depth { |n| ruby_count.((1..n).to_a) }
+    ours = probe_depth { |n| count.((1..n).to_a) }
+    assert_operator ours, :>=, ruby_limit * 0.8, "recursion depth #{ours} vs plain Ruby #{ruby_limit}"
+  end
+
+  def dispatch
+    yield
+  end
+
+  def probe_depth
+    n = 500
+    loop do
+      begin
+        yield n
+      rescue SystemStackError
+        return n
+      end
+      n = (n * 1.3).to_i
+      return n if n > 1_000_000
+    end
+  end
+
+  def test_tail_calls_run_in_constant_stack
+    # go acc [] = acc ; go acc (x:xs) = go (acc + x) xs
+    go = fn(:go) do
+      on("acc", "[]") { |acc| acc }
+      on("acc", "(x:xs)") { |acc, x, xs| go.tail(acc + x, xs) }
+    end
+    assert_equal 500_000 * 500_001 / 2, go.(0, (1..500_000).to_a)
+    # tail calls between different functions
+    even = odd = nil
+    even = fn(:even) { on("0") { true }; on("n") { |n| odd.tail(n - 1) } }
+    odd = fn(:odd) { on("0") { false }; on("n") { |n| even.tail(n - 1) } }
+    assert even.(1_000_000)
+    refute odd.(1_000_000)
+    # the marker is an ordinary value outside a call
+    assert_equal HaskellMatch::TailCall.new(go, [1, 2]), go.tail(1, 2)
+    assert_raises(TypeError) { fn { on("x") { HaskellMatch::TailCall.new(5, [1]) } }.(1) }
+    assert_raises(ArgumentError) { fn { on("x") { HaskellMatch::TailCall.new(go, 1) } }.(1) }
+  end
+
+  def test_recursion_by_name_and_recur
+    # the function is in scope inside its own clauses under its name...
+    assert_equal 6, fn(:fact) { on("0") { 1 }; on("n") { |n| n * fact.(n - 1) } }.(3)
+    # ...and as `recur`, whatever the name
+    assert_equal 120, fn { on("0") { 1 }; on("n") { |n| n * recur.(n - 1) } }.(5)
+    assert_equal 120, fn(nil) { on("0") { 1 }; on("n") { |n| n * this.(n - 1) } }.(5)
+    # mutual recursion through local variables
+    even = odd = nil
+    even = fn(:even) { on("0") { true }; on("n") { |n| odd.(n - 1) } }
+    odd = fn(:odd) { on("0") { false }; on("n") { |n| even.(n - 1) } }
+    assert even.(10)
+    refute odd.(10)
+    # a name that is not a valid method name is simply not defined
+    f = fn("not a method name") { on("0") { 1 }; on("n") { |n| recur.(n - 1) } }
+    assert_equal 1, f.(3)
+    # a clause name clashing with the builder's own methods does not override it
+    on = fn(:on) { on("0") { :zero }; on("_") { recur.(0) } }
+    assert_equal :zero, on.(5)
   end
 
   def test_callable_protocols
@@ -438,7 +567,7 @@ class FunctionTest < Minitest::Test
     assert_equal 0, f.(Nothing)
   end
 
-  def test_nil_and_arbitrary_objects_only_match_variables
+  def test_nil_and_arbitrary_objects
     f = fn { on("x") { |x| x } }
     assert_nil f.(nil)
     o = Object.new
