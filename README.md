@@ -467,11 +467,14 @@ Facts about segments:
   page-faults every page: the first 400k-deep call took 3.2 s, the second
   0.6 s, the third 0.35 s (0.9 µs per level); at 1M depth, 8.9 s then 2.8 s.
   Budget for the cold run if a deep recursion happens once.
-* **GC cost grows with live depth.** A GC that runs while the recursion is
-  pending must mark every live fiber stack, so a collection costs O(depth)
-  and a deep computation that allocates heavily pays that repeatedly.
-  `GC.disable` around a known deep computation, or a larger
-  `RUBY_GC_HEAP_INIT_SLOTS`, removes that term.
+* **GC cost grows with live depth.** Fiber objects are not write-barrier
+  protected, so every collection, minor ones included, re-marks the VM and
+  machine stacks of every suspended segment: a GC during a pending recursion
+  costs O(depth), and a deep computation that allocates heavily pays that on
+  each of its collections. This is inherent to keeping the recursion on real
+  stacks; `defer` avoids it (its heap stack is generational-GC friendly, see
+  below), and `GC.disable` around a known deep computation, or a larger
+  `RUBY_GC_HEAP_INIT_SLOTS`, reduces the number of collections.
 * **Semantics across a segment boundary.** Exceptions propagate normally
   (`rb_fiber_resume` re-raises them in the parent), but the backtrace only
   covers the innermost segment. Non-local exits do not cross: `throw` to a
@@ -514,18 +517,28 @@ end
 ```
 
 `f.defer(args...) { |result| ... }` is a tail call that carries a
-continuation. The native `call` pushes the block on a Ruby array it owns and
+continuation. The native `call` pushes the block on a stack it owns and
 continues with the call; when a body finally returns an ordinary value, the
 pending blocks are applied to it last-in first-out, each possibly returning
-another marker. The recursion's stack is that array, on the heap, so it is
-bounded by memory alone and `max_depth` never triggers: 2M levels completed
-in 31 s at 770 MB. Per level it costs one Proc plus its environment (about
-200–400 bytes) and about 4 µs, of which about 20% is GC marking the growing
-array (1M levels: 5.4 s with GC on, 4.3 s with GC off). Prefer `defer` over
-plain recursion when depth is known to be large and memory matters; prefer
-plain recursion when it is not, since `defer` requires writing the
-continuation by hand and runs the continuation outside the body's frame
-(`self` and closure variables are those of the block, as usual).
+another marker. The recursion's stack lives on the heap, so it is bounded by
+memory alone and `max_depth` never triggers.
+
+That stack is deliberately a chain of 256-element Ruby arrays rather than one
+growing array. Ruby's GC is generational: an old array that is written to is
+put on the remembered set and rescanned in full by every minor collection, so
+a single million-element stack would have made each GC O(depth). A full chunk
+is never written again, gets promoted, and is skipped by minor GCs; only the
+current chunk is rescanned. The difference is large: 2M levels took 31 s with
+one array and 8.9 s with chunks (1M: 5.4 s vs 3.8 s), and peak memory fell
+from 770 MB to 470 MB because the old array's doubling growth is gone.
+
+Per level `defer` costs one Proc plus its environment (about 200 bytes) and
+about 4 µs, mostly the allocation and the minor GCs it triggers (878 minor
+GCs over a 2M-deep run, each cheap). Prefer `defer` over plain recursion when
+depth is known to be large and memory matters; prefer plain recursion when it
+is not, since `defer` requires writing the continuation by hand and runs the
+continuation outside the body's frame (`self` and closure variables are those
+of the block, as usual).
 
 ### The depth guard
 
@@ -545,7 +558,7 @@ recursion does not shift later limits.
 | Pattern of recursion                      | Use                      | Space       | Time per level (warm) |
 |-------------------------------------------|--------------------------|-------------|-----------------------|
 | Loop with accumulator, fold, state machine| `f.tail(...)`            | O(1)        | ~1.1 µs               |
-| Deep non-tail recursion, depth known large| `f.defer(...) { }`       | ~300 B/level| ~4 µs                 |
+| Deep non-tail recursion, depth known large| `f.defer(...) { }`       | ~200 B/level| ~4 µs                 |
 | Ordinary recursion, depth moderate        | plain `f.(...)`          | ~1.6 KB/level (≤ `max_depth`) | ~0.9 µs (first call slower) |
 | Infinite data                             | `HaskellMatch.lazy` + patterns | per element forced | per element |
 

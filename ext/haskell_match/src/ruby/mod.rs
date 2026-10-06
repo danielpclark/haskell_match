@@ -694,6 +694,51 @@ fn check_guards(guards: Value) -> Result<(), String> {
     }
 }
 
+/// Continuations pending in a trampolined call, kept as a chain of small
+/// Ruby arrays rather than one growing array.  A full chunk is never written
+/// again, so once Ruby's generational GC promotes it, minor collections skip
+/// it; with a single array every push would re-mark the whole stack on each
+/// minor GC, making GC cost grow with recursion depth.
+const CONT_CHUNK: i64 = 256;
+
+struct ContStack {
+    /// Current chunk: element 0 links to the previous chunk (or nil).
+    chunk: Value,
+}
+
+impl ContStack {
+    fn new() -> Self {
+        ContStack {
+            chunk: Value::from(rutie::rubysys::value::RubySpecialConsts::Nil as usize),
+        }
+    }
+
+    #[inline]
+    unsafe fn push(&mut self, k: Value) {
+        if self.chunk.is_nil() || array::rb_ary_len(self.chunk) as i64 > CONT_CHUNK {
+            let fresh = array::rb_ary_new_capa((CONT_CHUNK + 1) as _);
+            array::rb_ary_push(fresh, self.chunk);
+            self.chunk = fresh;
+        }
+        array::rb_ary_push(self.chunk, k);
+    }
+
+    /// Pop the most recent continuation, or nil when none is pending.
+    #[inline]
+    unsafe fn pop(&mut self) -> Value {
+        loop {
+            if self.chunk.is_nil() {
+                return self.chunk;
+            }
+            if array::rb_ary_len(self.chunk) <= 1 {
+                self.chunk = array::rb_ary_entry(self.chunk, 0);
+                continue;
+            }
+            return array::rb_ary_pop(self.chunk);
+        }
+    }
+}
+
 /// matcher.call(*args): select a clause and call its body (from `@bodies`,
 /// with guards from `@guards`).
 ///
@@ -703,7 +748,7 @@ fn check_guards(guards: Value) -> Result<(), String> {
 /// * with a nil continuation (`Function#tail`) the call simply continues
 ///   with that function and those arguments, in constant stack space;
 /// * with a continuation (`Function#defer`) the continuation is pushed on a
-///   Ruby array owned by this frame and the call continues; once a body
+///   chunked stack owned by this frame and the call continues; once a body
 ///   returns an ordinary value the pending continuations are applied to it
 ///   one after another (each may itself return a `TailCall`).
 ///
@@ -712,8 +757,8 @@ fn check_guards(guards: Value) -> Result<(), String> {
 unsafe extern "C" fn matcher_call(argc: c_int, argv: *const Value, rtself: Value) -> Value {
     let mut buf = [Value::from(0); STACK_BINDS];
     let mut target = rtself;
-    // Pending continuations (a Ruby array, rooted by this frame).
-    let mut conts = Value::from(rutie::rubysys::value::RubySpecialConsts::Nil as usize);
+    // Pending continuations (Ruby arrays, rooted by this frame).
+    let mut conts = ContStack::new();
     // The current marker keeps the next arguments alive while they are matched.
     let mut marker = Value::from(0);
     let mut args_vec: Vec<Value> = Vec::new();
@@ -756,11 +801,11 @@ unsafe extern "C" fn matcher_call(argc: c_int, argv: *const Value, rtself: Value
         };
         // Apply pending continuations until one asks for another call.
         while rclass::rb_obj_class(result).value != tail_class {
-            if conts.is_nil() || array::rb_ary_len(conts) == 0 {
+            let k = conts.pop();
+            if k.is_nil() {
                 std::hint::black_box(marker);
                 return result;
             }
-            let k = array::rb_ary_pop(conts);
             result = rutie::rubysys::rproc::rb_proc_call_with_block(
                 k,
                 1,
@@ -777,10 +822,7 @@ unsafe extern "C" fn matcher_call(argc: c_int, argv: *const Value, rtself: Value
             raise_arg("TailCall arguments must be an Array");
         }
         if !continuation.is_nil() {
-            if conts.is_nil() {
-                conts = array::rb_ary_new();
-            }
-            array::rb_ary_push(conts, continuation);
+            conts.push(continuation);
         }
         // The matcher type is checked by `matcher_of` on the next iteration.
         target = function;
