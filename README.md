@@ -1,89 +1,409 @@
 # haskell_match
 
-Haskell's pattern matching for Ruby, implemented in Rust with
-[Rutie](https://github.com/danielpclark/rutie).
-
-* **Haskell pattern syntax**, as strings: constructors, literals, variables,
-  wildcards, lists `[]` / `(x:xs)` / `[a, b]`, tuples, as-patterns `all@(x:_)`,
-  lazy patterns `~p`, bang patterns `!x`, record patterns
-  `Person { name = n, .. }`, guards and `otherwise`.
-* **Algebraic data types** declared with Haskell `data` syntax; constructors
-  are frozen `Data` values with Haskell-style `inspect`.
-* **Every logical path accounted for.** Like GHC, the compiler rejects a
-  function whose clauses are not exhaustive and lists the patterns not
-  matched; it also rejects clauses that can never be reached. Positions whose
-  patterns disagree in type are a compile error. At run time a value that no
-  pattern of the function could accept raises a type-mismatch error (the
-  error Haskell's type checker would have given), while `_` and variables
-  match anything, exactly as in Haskell.
-* **Patterns with or without quotes.** Write Haskell syntax in a string, or
-  write the pattern in place as Ruby: `on([x, *xs])`, `on(Just(Just(_)))`,
-  `on(Person(name: n))`. Both forms build the same pattern and can be mixed.
-* **Lazy lists.** `(x:xs)` patterns match `HaskellMatch.lazy(1..)` and Ruby
-  Enumerators, so infinite lists work as they do in Haskell.
-* **Recursion without Ruby's stack limit.** Plain recursion is carried across
-  chained Fiber stacks, tail calls run in constant space, and a depth guard
-  turns a runaway recursion into an error instead of exhausted memory.
-* **Fast.** Clauses are compiled once (Maranget-style) into a decision tree
-  that inspects each argument position at most once per path, and matching
-  runs in Rust directly over Ruby `VALUE`s with no allocation until a clause
-  is chosen. List tails are shared slices, not copies.
+Haskell's pattern matching, brought to Ruby in full: algebraic data types,
+clauses that destructure their arguments, and a compiler that refuses to build
+a function with a hole in it. The matcher is written in Rust (via
+[Rutie](https://github.com/danielpclark/rutie)), compiles each function once
+into a decision tree, and runs it directly over Ruby values.
 
 ```ruby
 require "haskell_match"
 
-HaskellMatch.data "Maybe a = Nothing | Just a"
-HaskellMatch.data "Shape = Circle Double | Rect Double Double"
-include Maybe
+HaskellMatch.data "Shape = Circle Double | Rect Double Double | Triangle Double Double Double"
 include Shape
 
-from_maybe = HaskellMatch.fn(:from_maybe) do
-  on("d", "Nothing") { |d| d }
-  on("_", "Just x")  { |x| x }
-end
-
-from_maybe.(0, Just.new(5))   # => 5
-from_maybe.(0, Nothing)       # => 0
-
 area = HaskellMatch.fn(:area) do
-  on("Circle r") { |r| 3.14159 * r * r }
-  on("Rect w h") { |w, h| w * h }
+  on("Circle r")       { |r| 3.14159 * r * r }
+  on("Rect w h")       { |w, h| w * h }
+  on(Triangle(a, b, c)) do |a, b, c|
+    s = (a + b + c) / 2.0
+    Math.sqrt(s * (s - a) * (s - b) * (s - c))
+  end
 end
 
-length = HaskellMatch.fn(:length) do
-  on("[]")     { 0 }
-  on("(_:xs)") { |xs| 1 + length.(xs) }
-end
-length.([1, 2, 3])            # => 3
-
-# the same, with the patterns written in place
-length = HaskellMatch.fn(:length) do
-  on([])        { 0 }
-  on([_, *xs])  { |xs| 1 + length.(xs) }
-end
+area.(Rect.new(2, 3))          # => 6
+area.(Triangle[3, 4, 5])       # => 6.0
 ```
 
-Leave a case out and the definition fails, exactly where Haskell would warn:
+Two of those clauses are Haskell written in a string; the third is the same
+pattern written as Ruby. Both forms build the same decision tree, and you can
+use whichever reads better, line by line.
+
+## Why every path must be accounted for
+
+In most Ruby code, the case you forgot is found by a user. A `case` with no
+`else` silently returns `nil`; an `if` chain that misses a branch falls
+through; a `Hash#fetch` without a default raises in production at three in the
+morning. The fix is always the same, and always late: add the branch you did
+not think of.
+
+Haskell inverts this. A function defined by patterns is a *claim* about the
+shape of its input, and the compiler checks the claim: if the clauses do not
+cover every value the type allows, the program does not compile, and the
+message tells you exactly which values fell through. haskell_match brings that
+discipline to Ruby at definition time:
 
 ```ruby
 HaskellMatch.fn(:area) do
   on("Circle r") { |r| 3.14159 * r * r }
+  on("Rect w h") { |w, h| w * h }
 end
 # HaskellMatch::NonExhaustiveError:
 # Pattern match(es) are non-exhaustive
 # In an equation for 'area':
 #     Patterns not matched:
-#         Rect _ _
+#         Triangle _ _ _
+```
 
-HaskellMatch.fn(:silly) do
-  on("_")      { 1 }
-  on("Just x") { |x| x }
+This changes how code evolves. Add a constructor to a type (`| Hexagon
+Double`) and every function that matches on that type fails to load, each one
+pointing at the exact case to write. There is no grep for call sites, no
+"should be fine", no test suite hoping to cover the new branch: the compiler
+has already enumerated the paths and found the missing one. Teams that adopt
+this stop writing defensive `else raise "unreachable"` branches, because
+unreachable is now something the compiler proves rather than something a
+comment asserts.
+
+The same analysis catches the opposite mistake, a clause that can never run:
+
+```ruby
+HaskellMatch.data "Maybe a = Nothing | Just a"
+include Maybe
+
+HaskellMatch.fn(:describe) do
+  on("_")      { "something" }
+  on("Just x") { |x| "just #{x}" }
 end
 # HaskellMatch::RedundantClauseError:
 # Pattern match is redundant
-# In an equation for 'silly':
-#     silly Just x = ... (example.rb:3)
+# In an equation for 'describe':
+#     describe Just x = ... (example.rb:3)
 ```
+
+Redundant clauses are dead code with a story: usually an earlier clause grew
+broader than intended, or two people each handled a case. Either way the
+compiler found the contradiction in the reasoning before it became a bug.
+
+The check is precise, not merely cautious. Nested patterns, literals, lists,
+tuples and records are all enumerated, and the witnesses are concrete:
+
+```ruby
+HaskellMatch.data "Tree a = Leaf | Node (Tree a) a (Tree a)"
+include Tree
+
+HaskellMatch.fn(:depth) do
+  on("Leaf")                   { 0 }
+  on("Node Leaf _ Leaf")       { 1 }
+  on("Node (Node _ _ _) _ _")  { |*| :deep }
+end
+# Patterns not matched:
+#     Node Leaf _ (Node _ _ _)
+```
+
+Haskell's type checker also rejects a function that matches a `Maybe` in one
+clause and a list in another. Ruby has no static types, so haskell_match
+checks what it can at definition time (all clauses must agree on the shape of
+each position) and defers the rest to the call: a value that *no* clause could
+accept raises `TypeMismatchError`, while `_` and variables accept anything,
+exactly as Haskell's wildcard does.
+
+## A tour, in both dialects
+
+Everything below mixes the two ways of writing a pattern. A String given to
+`on` is Haskell syntax; anything else is the pattern written in place, where
+bare names are variables, `_` is the wildcard, `[x, *xs]` is `(x:xs)`, and
+`Just(x)` or `Just[x]` applies a constructor.
+
+### Data types and constructors
+
+```ruby
+HaskellMatch.data "Either a b = Left a | Right b"
+HaskellMatch.data "Contact = Person { name :: String, age :: Int }"
+include Either
+include Contact
+
+Just.new(1)                          # => Just 1
+Just[Just[Nothing]]                  # => Just (Just Nothing)
+Person.new(name: "Ann", age: 30)     # => Person {name = "Ann", age = 30}
+[1, 2].map(&Just)                    # => [Just 1, Just 2]
+Nothing.frozen?                      # => true
+```
+
+Constructors are frozen `Data` values: they compare by value, hash, print as
+Haskell would, and work with Ruby's own `case/in` too.
+
+### Maybe and Either, the everyday cases
+
+```ruby
+from_maybe = HaskellMatch.fn(:from_maybe) do
+  on("d", "Nothing") { |d| d }
+  on(_, Just(x))     { |x| x }
+end
+from_maybe.(0, Just.new(5))          # => 5
+from_maybe.(0, Nothing)              # => 0
+
+either = HaskellMatch.fn(:either) do
+  on("Left e")  { |e| "error: #{e}" }
+  on(Right(v))  { |v| "ok: #{v}" }
+end
+either.(Left.new("boom"))            # => "error: boom"
+either.(Right[42])                   # => "ok: 42"
+```
+
+### Lists, strings and recursion
+
+A Ruby Array is a Haskell list, and so is a Ruby String (`String = [Char]`):
+
+```ruby
+length = HaskellMatch.fn(:length) do
+  on("[]")      { 0 }
+  on([_, *xs])  { |xs| 1 + length.(xs) }
+end
+length.([1, 2, 3])                   # => 3
+length.("haskell")                   # => 7
+
+zip = HaskellMatch.fn(:zip) do
+  on("(x:xs)", [y, *ys]) { |x, xs, y, ys| [[x, y]] + zip.(xs, ys) }
+  on("_", "_")           { [] }
+end
+zip.([1, 2, 3], %w[a b])             # => [[1, "a"], [2, "b"]]
+
+greeting = HaskellMatch.fn(:greeting) do
+  on('""')             { "Hello, stranger" }
+  on("('A':_)")        { "Hello, A-person" }
+  on([c, *_])          { |c| "Hello, #{c.upcase}-person" }
+end
+greeting.("")                        # => "Hello, stranger"
+greeting.("Ann")                     # => "Hello, A-person"
+greeting.("bob")                     # => "Hello, B-person"
+```
+
+Bound tails share storage with the original (a copy-on-write slice), so
+recursing down a list does not copy it.
+
+### Guards, as-patterns and nesting
+
+```ruby
+classify = HaskellMatch.fn(:classify) do
+  on(Just(x), guard: ->(x) { x.negative? })  { :negative }
+  on("Just 0")                               { :zero }
+  on(Just(x), where: ->(x) { x.even? })      { :even }
+  on("Just _")                               { :odd }
+  on(Nothing)                                { :none }
+end
+[Just[-1], Just[0], Just[2], Just[3], Nothing].map(&classify)
+# => [:negative, :zero, :even, :odd, :none]
+
+dedupe = HaskellMatch.fn(:dedupe) do
+  on("(x:rest@(y:_))", guard: ->(x, y) { x == y }) { |rest| dedupe.(rest) }
+  on([x, *rest])                                    { |x, rest| [x] + dedupe.(rest) }
+  on([])                                            { [] }
+end
+dedupe.([1, 1, 2, 3, 3, 3, 4])      # => [1, 2, 3, 4]
+
+flatten_maybe = HaskellMatch.fn(:flatten_maybe) do
+  on("Just (Just x)") { |x| Just[x] }
+  on(Just(Nothing))   { Nothing }
+  on(Nothing)         { Nothing }
+end
+flatten_maybe.(Just[Just[7]])        # => Just 7
+```
+
+A guarded clause may fall through, so (as in GHC) it does not count towards
+coverage; `otherwise` does.
+
+### Records and tuples
+
+```ruby
+can_vote = HaskellMatch.fn(:can_vote) do
+  on("Person { age = a }", guard: ->(a) { a >= 18 }) { true }
+  on(Person(**_))                                    { false }
+end
+can_vote.(Person.new("Ann", 30))     # => true
+
+introduce = HaskellMatch.fn(:introduce) do
+  on(Person(name: n, age: a)) { |n, a| "#{n} is #{a}" }
+end
+introduce.(Person.new("Bob", 7))     # => "Bob is 7"
+
+swap = HaskellMatch.fn(:swap) { on("(a, b)") { |a, b| [b, a] } }
+swap.([1, 2])                        # => [2, 1]
+
+dist = HaskellMatch.fn(:dist) { on(tuple(x1, y1), tuple(x2, y2)) { |x1, y1, x2, y2| Math.hypot(x2 - x1, y2 - y1) } }
+dist.([0, 0], [3, 4])                # => 5.0
+```
+
+Tuples are Arrays of a fixed length, lists are Arrays of any length; the
+compiler keeps the two apart just as Haskell does.
+
+### Expressions, patterns as objects, and methods
+
+```ruby
+# case ... of
+HaskellMatch.case_of(Just[3]) do
+  on("Just x", guard: ->(x) { x > 10 }) { |x| "big #{x}" }
+  on(Just(x))  { |x| "just #{x}" }
+  on(Nothing)  { "nothing" }
+end                                  # => "just 3"
+
+# a pattern on its own, usable in case/when
+head = HaskellMatch.pattern { Just([x, *_]) }
+head.match(Just[[9, 8]])             # => {:x=>9}
+head === Just[[]]                    # => false
+
+# methods defined by clauses, with access to self
+class Account
+  extend HaskellMatch::DSL
+  include Maybe
+
+  attr_reader :balance
+  def initialize(balance) = @balance = balance
+  def limit = 100
+
+  hdef :deposit do
+    on(Nothing)     { self }
+    on(Just(amt), guard: ->(amt) { amt <= limit }) { |amt| Account.new(balance + amt) }
+    on("Just amt")  { |amt| raise ArgumentError, "over limit: #{amt}" }
+  end
+end
+Account.new(10).deposit(Just[50]).balance   # => 60
+```
+
+### Bindings your way
+
+Name your block parameters after the pattern's variables and take any subset
+in any order; keywords work too:
+
+```ruby
+f = HaskellMatch.fn(:f) do
+  on("(x:xs)") { |xs| xs }            # by name
+  on("[]")     { [] }
+end
+f.([1, 2, 3])                        # => [2, 3]
+
+g = HaskellMatch.fn(:g) { on([x, *xs]) { |x:, xs:| { x: x, xs: xs } }; on([]) { {} } }
+g.([1, 2])                           # => {:x=>1, :xs=>[2]}
+```
+
+## Recursion without limits, and laziness
+
+Haskell programs loop by recursing and process infinite data by being lazy.
+Ruby's VM gives a fixed stack to each thread and evaluates eagerly, so a
+faithful port has to supply both. haskell_match does, in three complementary
+ways.
+
+### Plain recursion goes as deep as memory allows
+
+```ruby
+count = HaskellMatch.fn(:count) do
+  on([])        { 0 }
+  on([_, *xs])  { |xs| 1 + count.(xs) }
+end
+count.((1..200_000).to_a)            # => 200000
+```
+
+A Ruby lambda written the same way dies with `SystemStackError` around 10,000
+levels. Here the native call runs every hundredth nested body on a fresh
+Fiber, chaining their stacks the way GHC grows its own, so the depth limit
+becomes memory rather than a fixed buffer. You write the obvious code and it
+works; the cost is about 1.6 KB per level while the recursion is pending, and
+`HaskellMatch.max_depth` (250,000 by default) turns a runaway recursion into
+a clear `StackOverflowError` instead of a swallowed machine.
+
+### Tail calls run in constant space
+
+```ruby
+sum = HaskellMatch.fn(:sum) do
+  on(acc, [])        { |acc| acc }
+  on(acc, [x, *xs])  { |acc, x, xs| sum.tail(acc + x, xs) }
+end
+sum.(0, (1..1_000_000).to_a)         # => 500000500000
+
+collatz_steps = HaskellMatch.fn(:collatz_steps) do
+  on(1, n)                                { |n| n }
+  on(k, n, guard: ->(k) { k.even? })      { |k, n| collatz_steps.tail(k / 2, n + 1) }
+  on(k, n)                                { |k, n| collatz_steps.tail(3 * k + 1, n + 1) }
+end
+collatz_steps.(27, 0)                # => 111
+```
+
+`f.tail(args)` is Haskell's tail call made explicit: the native loop replaces
+the arguments and matches again on the same frame. Any loop a Haskell program
+would write as an accumulator, a fold, a state machine or a server loop runs
+this way in O(1) space, including mutual recursion between functions, with
+nothing counted against the depth limit.
+
+### Deferred calls keep deep recursion cheap
+
+```ruby
+length = HaskellMatch.fn(:length) do
+  on([])        { 0 }
+  on([_, *xs])  { |xs| length.defer(xs) { |n| 1 + n } }    # 1 + length xs
+end
+length.((1..2_000_000).to_a)         # => 2000000
+```
+
+`defer` names the continuation that plain recursion leaves implicit. The
+pending blocks live on a heap stack owned by the native call, about 200 bytes
+each, chunked so Ruby's generational GC never rescans the whole stack. Use it
+when a non-tail recursion is known to go very deep and memory matters.
+
+### Lazy lists make infinite data ordinary
+
+```ruby
+take = HaskellMatch.fn(:take) do
+  on(0, _)          { [] }
+  on(_, [])         { [] }
+  on(n, [x, *xs])   { |n, x, xs| [x] + take.(n - 1, xs) }
+end
+
+naturals = HaskellMatch.lazy(1..)
+take.(5, naturals)                               # => [1, 2, 3, 4, 5]
+
+powers = HaskellMatch::LazyList.iterate(1) { |x| x * 2 }
+take.(8, powers)                                 # => [1, 2, 4, 8, 16, 32, 64, 128]
+
+fibs = HaskellMatch.lazy(Enumerator.new { |y| a, b = 0, 1; loop { y << a; a, b = b, a + b } })
+take.(10, fibs)                                  # => [0, 1, 1, 2, 3, 5, 8, 13, 21, 34]
+
+# any Enumerator is a list; Ruby's lazy pipelines compose with the patterns
+take.(3, (1..).lazy.select(&:even?).map { |x| x * x })   # => [4, 16, 36]
+```
+
+A `LazyList` is a memoised cons list: `(x:xs)` forces one cell, binds `xs` to
+the rest still unevaluated, and every forced cell is computed once and shared
+by all consumers, which is exactly Haskell's evaluation model for lists. The
+advantages carry over intact. Producers and consumers are written separately
+and composed; a generator never needs to know how much of it will be used;
+`take.(n, expensive_stream)` does `n` units of work and no more; and the same
+`take` serves finite Arrays, Strings, lazy lists and Ruby Enumerators without
+a line changing, because they are all one type to the pattern compiler.
+
+Together these give Ruby the two things Haskell relies on for "infinite"
+programs: loops that do not consume stack, and data that does not have to
+exist before it is asked for.
+
+## At a glance
+
+* **Haskell pattern syntax**, quoted or written in place: constructors,
+  literals, variables, wildcards, lists, tuples, as-patterns `all@(x:_)`,
+  lazy patterns `~p`, bang patterns `!x`, record patterns `Person { name = n, .. }`,
+  guards and `otherwise`, with both forms freely mixed.
+* **Algebraic data types** declared with Haskell `data` syntax; constructors
+  are frozen `Data` values with Haskell-style `inspect`.
+* **Every logical path accounted for**: non-exhaustive and redundant clauses
+  are definition-time errors with GHC-style messages; positions whose
+  patterns disagree in type are a compile error; `_` and variables match
+  anything, and a value no pattern can accept raises `TypeMismatchError`.
+* **Strings are lists of characters**, as in Haskell; lazy lists and
+  Enumerators are lists too.
+* **Recursion without Ruby's stack limit**: chained Fiber stacks, constant-
+  space tail calls, deferred continuations, and a depth guard.
+* **Fast**: one Maranget-style decision tree per function, matching in Rust
+  over Ruby `VALUE`s with no allocation until a clause is chosen, and list
+  tails as shared slices.
+* **Thread-, fiber- and Ractor-safe**, with `ractor: true` producing
+  shareable functions.
 
 ## Installation
 
