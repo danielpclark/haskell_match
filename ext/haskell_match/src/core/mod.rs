@@ -5,6 +5,7 @@
 pub mod ast;
 pub mod error;
 pub mod exhaust;
+pub mod hs;
 pub mod lexer;
 pub mod parser;
 pub mod pretty;

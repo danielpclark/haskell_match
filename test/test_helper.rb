@@ -3,6 +3,7 @@
 $LOAD_PATH.unshift File.expand_path("../lib", __dir__)
 require "minitest/autorun"
 require "stringio"
+require "tmpdir"
 require "haskell_match"
 
 # Shared data types used across the suite.  Declared once; tests that need

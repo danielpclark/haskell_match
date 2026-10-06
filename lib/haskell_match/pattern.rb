@@ -10,7 +10,7 @@ module HaskellMatch
   class Pattern
     attr_reader :source, :names
 
-    def initialize(source = nil, &block)
+    def initialize(source = nil, scope: Native::GLOBAL_SCOPE, &block)
       if block
         raise ArgumentError, "pass either a pattern string or a block, not both" if source
 
@@ -19,7 +19,8 @@ module HaskellMatch
       raise ArgumentError, "pattern must be a String" unless source.is_a?(String)
 
       @source = source.dup.freeze
-      @matcher = Native::Matcher.new("pattern #{source.inspect}", [[source]], [false], 1)
+      @scope = scope
+      @matcher = Native::Matcher.new("pattern #{source.inspect}", [[source]], [false], 1, scope)
       @names = @matcher.names.first.map(&:to_sym).freeze
       @exhaustive = @matcher.instance_variable_get(:@missing).empty?
       freeze
@@ -64,8 +65,8 @@ module HaskellMatch
 
   class << self
     # `HaskellMatch.pattern("Just (x:_)")` or `HaskellMatch.pattern { Just([x, *_]) }`
-    def pattern(source = nil, &block)
-      Pattern.new(source, &block)
+    def pattern(source = nil, scope: Native::GLOBAL_SCOPE, &block)
+      Pattern.new(source, scope: scope, &block)
     end
     alias [] pattern
   end

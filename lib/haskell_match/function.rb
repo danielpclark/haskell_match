@@ -49,11 +49,13 @@ module HaskellMatch
     # {DeepCall}): about 100 ns slower per call, but deep recursion costs a
     # tenth of the memory and the GC scans a fifth as much.  The default is
     # {HaskellMatch.deep_by_default}.
-    def self.define(name, builder, exhaustive:, overlapping:, ractor: false, deep: HaskellMatch.deep_by_default)
+    def self.define(name, builder, exhaustive:, overlapping:, ractor: false, deep: HaskellMatch.deep_by_default,
+                    scope: Native::GLOBAL_SCOPE)
       clauses = builder.clauses
       clauses = make_shareable(clauses) if ractor
       f, bodies, guards = Compiler.compile(name.to_s, clauses, exhaustive: exhaustive,
-                                                             overlapping: overlapping, klass: self)
+                                                             overlapping: overlapping, klass: self, scope: scope)
+      f.instance_variable_set(:@scope, scope)
       f.extend(DeepCall.module_for(f.arity)) if deep
       f.send(:attach, clauses, bodies, guards)
       builder.define_function(f, name.to_s)
@@ -101,6 +103,17 @@ module HaskellMatch
 
     def curry
       to_proc.curry(arity)
+    end
+
+    # The function as a curried Proc (memoised); what Haskell code receives
+    # when it passes a function as a value.
+    def curried
+      return to_proc if arity == 1
+      return @curried if defined?(@curried) && @curried
+
+      c = to_proc.curry(arity)
+      @curried = c unless frozen?
+      c
     end
 
     # Variables bound by each clause, in order.
@@ -190,13 +203,15 @@ module HaskellMatch
     # * `overlapping:` true/:error (default), :warn, or false/:ignore
     # * `ractor:`      true to make the function Ractor-shareable (see {Function.define})
     # * `deep:`        true for Ruby-level body invocation (cheap deep recursion)
+    # * `scope:`       the type scope the patterns resolve constructors in (see {HaskellMatch.new_scope})
     def fn(name = nil, exhaustive: self.exhaustive, overlapping: self.overlapping, ractor: false,
-           deep: deep_by_default, &definition)
+           deep: deep_by_default, scope: Native::GLOBAL_SCOPE, &definition)
       raise ArgumentError, "HaskellMatch.fn needs a block with on(...) clauses" unless definition
 
       builder = ClauseBuilder.collect(definition, ractor: ractor)
       name ||= "anonymous function at #{definition.source_location&.join(':')}"
-      Function.define(name, builder, exhaustive: exhaustive, overlapping: overlapping, ractor: ractor, deep: deep)
+      Function.define(name, builder, exhaustive: exhaustive, overlapping: overlapping, ractor: ractor, deep: deep,
+                                     scope: scope)
     end
   end
 end

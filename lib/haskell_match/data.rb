@@ -81,6 +81,31 @@ module HaskellMatch
       value.is_a?(Constructor) && value.class.data_type.equal?(self)
     end
 
+    # Haskell keeps types and constructors in separate namespaces; for
+    # `data Person = Person {...}` the type module answers `new`, `[]` and
+    # `call` with the same-named constructor, so `Person.new("Al", 3)` works
+    # whether `Person` names the type or the constructor.
+    def new(*args, **kwargs)
+      same_named_constructor.new(*args, **kwargs)
+    end
+
+    def [](*args)
+      same_named_constructor[*args]
+    end
+
+    def call(*args)
+      same_named_constructor.call(*args)
+    end
+
+    def same_named_constructor
+      k = constructor_classes.find { |c| c.constructor_name == type_name }
+      raise NoMethodError, "#{inspect} has no constructor named #{type_name}" if k.nil?
+      raise NoMethodError, "#{type_name} is a nullary constructor: use #{type_name}::#{type_name}" if k.nullary?
+
+      k
+    end
+    private :same_named_constructor
+
     def inspect
       "data #{[type_name, *type_variables].join(' ')} = " +
         constructor_classes.map do |k|
@@ -94,6 +119,19 @@ module HaskellMatch
   end
 
   class << self
+    # Constructor classes and nullary values by name, as currently registered
+    # (a redefined type replaces its constructors).
+    def constructor(name, scope = Native::GLOBAL_SCOPE)
+      @constructors ||= {}
+      (@constructors[scope] || {})[name.to_s] || (scope != Native::GLOBAL_SCOPE ? constructor(name) : nil)
+    end
+
+    def register_constructors(classes, scope = Native::GLOBAL_SCOPE)
+      @constructors ||= {}
+      table = (@constructors[scope] ||= {})
+      classes.each { |k| table[k.constructor_name] = k.nullary? ? k.value : k }
+    end
+
     # Declare an algebraic data type.
     #
     #   HaskellMatch.data "Maybe a = Nothing | Just a"
@@ -105,10 +143,12 @@ module HaskellMatch
     # Returns a module with one constant per constructor and defines it as a
     # constant named after the type under `under` (default: `Object`, i.e. a
     # top-level constant, like a Haskell `data` declaration).  Pass
-    # `under: nil` to skip the constant definition.  Constructors with fields
+    # `under: nil` to skip the constant definition.  `scope:` registers the
+    # type in a type scope other than the global one (see {Native::GLOBAL_SCOPE}
+    # and {Haskell#haskell_scope}).  Constructors with fields
     # are `Data` subclasses (`Just.new(1)`, `Just[1]`, `Just.(1)`); nullary
     # constructors are frozen singleton values (`Nothing`).
-    def data(decl, under: Object, **constructors)
+    def data(decl, under: Object, scope: Native::GLOBAL_SCOPE, **constructors)
       name, tyvars, specs = normalize_data(decl, constructors)
       validate_type_name!(name)
 
@@ -150,11 +190,12 @@ module HaskellMatch
       mod.instance_variable_get(:@constructor_classes).concat(classes).freeze
 
       begin
-        Native.register_type(name, classes.map { |k| [k.constructor_name, k.arity, k.field_names&.map(&:to_s), k] })
+        Native.register_type(name, classes.map { |k| [k.constructor_name, k.arity, k.field_names&.map(&:to_s), k] }, scope)
       rescue CompileError
         home.send(:remove_const, name) if home.const_defined?(name, false)
         raise
       end
+      register_constructors(classes, scope)
       mod
     end
 

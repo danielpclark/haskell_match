@@ -48,6 +48,33 @@ module HaskellMatch
       from(Enumerator.produce(value) { value })
     end
 
+    # A cons cell with an already-known head in front of a lazy tail.
+    def self.cons(head, tail)
+      tail = from(tail) unless tail.is_a?(LazyList)
+      cell = allocate
+      cell.instance_variable_set(:@enum, nil)
+      cell.instance_variable_set(:@state, :cons)
+      cell.instance_variable_set(:@head, head)
+      cell.instance_variable_set(:@tail, tail)
+      cell
+    end
+
+    # A cons cell whose tail is computed on first use (Haskell's `x : e`
+    # when `e` is an unevaluated expression).  The block may return any list:
+    # an Array, a String, an Enumerator or another LazyList.
+    def self.lazy_cons(head, &tail)
+      cons(head, deferred(&tail))
+    end
+
+    # A list that is computed by `thunk` on first use.
+    def self.deferred(&thunk)
+      cell = allocate
+      cell.instance_variable_set(:@enum, nil)
+      cell.instance_variable_set(:@state, :thunk)
+      cell.instance_variable_set(:@tail, thunk)
+      cell
+    end
+
     # A finite or infinite list from `first` upwards (`[n..]`, `[n..m]`).
     def self.range(first, last = nil)
       from(last ? (first..last) : (first..))
@@ -63,6 +90,21 @@ module HaskellMatch
     # Called by the native matcher; memoised, so each element is produced
     # once.
     def force
+      if @state == :thunk
+        thunk = @tail
+        @tail = nil
+        @state = :forcing
+        list = thunk.call
+        list = LazyList.from(list.is_a?(String) ? list.each_char : list) unless list.is_a?(LazyList)
+        if (pair = list.force)
+          @head, @tail = pair
+          @state = :cons
+        else
+          @state = :nil
+        end
+      elsif @state == :forcing
+        raise MatchError, "a lazy list refers to itself before its first element is known"
+      end
       if @state == :unforced
         begin
           @head = @enum.next
@@ -121,6 +163,33 @@ module HaskellMatch
         cell = cell.instance_variable_get(:@tail)
       end
       [out, cell.instance_variable_get(:@state) == :nil]
+    end
+
+    # Element-wise equality with any list (does not terminate when both
+    # lists are infinite and equal, as in Haskell).
+    def ==(other)
+      return false unless other.respond_to?(:each)
+
+      a = each
+      b = other.each
+      loop do
+        x = begin
+          a.next
+        rescue StopIteration
+          return (b.next; false) rescue StopIteration; return true
+        end
+        y = begin
+          b.next
+        rescue StopIteration
+          return false
+        end
+        return false unless x == y
+      end
+    end
+    alias eql? ==
+
+    def hash
+      to_a.hash
     end
 
     def inspect

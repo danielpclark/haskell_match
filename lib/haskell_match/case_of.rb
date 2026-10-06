@@ -19,17 +19,17 @@ module HaskellMatch
 
     module_function
 
-    def evaluate(values, exhaustive:, overlapping:, &definition)
+    def evaluate(values, exhaustive:, overlapping:, scope: Native::GLOBAL_SCOPE, &definition)
       raise ArgumentError, "case_of needs a block with on(...) clauses" unless definition
       raise ArgumentError, "case_of needs at least one value" if values.empty?
 
       clauses = ClauseBuilder.collect(definition).clauses
-      key = cache_key(clauses, exhaustive, overlapping)
+      key = [scope, cache_key(clauses, exhaustive, overlapping)]
       entry = LOCK.synchronize { CACHE[key] }
       unless entry
         name = "case expression at #{definition.source_location&.join(':')}"
-        matcher, _bodies, _guards = Compiler.compile(name, clauses, exhaustive: exhaustive,
-                                                                     overlapping: overlapping, kind: "case expression")
+        matcher, _bodies, _guards = Compiler.compile(name, clauses, exhaustive: exhaustive, overlapping: overlapping,
+                                                                     kind: "case expression", scope: scope)
         entry = [matcher, matcher.names]
         LOCK.synchronize do
           CACHE.clear if CACHE.size >= MAX_CACHE
@@ -61,8 +61,9 @@ module HaskellMatch
 
   class << self
     # Evaluate a `case ... of` expression over one or more values.
-    def case_of(*values, exhaustive: self.exhaustive, overlapping: self.overlapping, &definition)
-      CaseOf.evaluate(values, exhaustive: exhaustive, overlapping: overlapping, &definition)
+    def case_of(*values, exhaustive: self.exhaustive, overlapping: self.overlapping, scope: Native::GLOBAL_SCOPE,
+                &definition)
+      CaseOf.evaluate(values, exhaustive: exhaustive, overlapping: overlapping, scope: scope, &definition)
     end
   end
 end

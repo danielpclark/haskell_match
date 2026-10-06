@@ -34,7 +34,10 @@ use crate::core::types::{ConSpec, TypeEnv};
 use runtime::{Bound, Matcher, RtError, STACK_BINDS};
 
 lazy_static! {
-    static ref ENV: Mutex<TypeEnv> = Mutex::new(TypeEnv::new());
+    /// Type scopes: index 0 is the global registry; every other scope is a
+    /// snapshot of the global one at its creation plus its own declarations
+    /// (a compiled Haskell module gets one, like a Haskell module namespace).
+    static ref SCOPES: Mutex<Vec<TypeEnv>> = Mutex::new(vec![TypeEnv::new()]);
     static ref MATCHER_TYPE: MatcherType = MatcherType::new();
 }
 
@@ -197,6 +200,24 @@ fn exception(class_name: &str, message: &str) -> AnyException {
     AnyException::from_class(&hm_class(class_name), message)
 }
 
+/// A scope id argument (raises ArgumentError when malformed).
+fn scope_arg(scope: Result<Integer, rutie::AnyException>) -> usize {
+    let n = scope
+        .unwrap_or_else(|_| raise_arg("scope must be an Integer"))
+        .to_i64();
+    if n < 0 {
+        raise_arg("scope must not be negative");
+    }
+    n as usize
+}
+
+/// The type environment of scope `id`.
+fn scope_env(scopes: &mut [TypeEnv], id: usize) -> Result<&mut TypeEnv, String> {
+    scopes
+        .get_mut(id)
+        .ok_or_else(|| format!("unknown type scope {}", id))
+}
+
 fn error_class(kind: ErrorKind) -> &'static str {
     match kind {
         ErrorKind::Syntax => "PatternSyntaxError",
@@ -333,12 +354,20 @@ methods!(
         out.push(cons);
         out
     },
-    // register_type(name, [[con_name, arity, fields_or_nil, klass], ...]) -> nil
-    fn native_register_type(name: RString, specs: Array) -> NilClass {
+    // new_scope -> Integer: a type scope seeded from the global registry
+    fn native_new_scope() -> Integer {
+        let mut scopes = SCOPES.lock().unwrap_or_else(|p| p.into_inner());
+        let seed = scopes[0].clone();
+        scopes.push(seed);
+        Integer::new((scopes.len() - 1) as i64)
+    },
+    // register_type(name, [[con_name, arity, fields_or_nil, klass], ...], scope) -> nil
+    fn native_register_type(name: RString, specs: Array, scope: Integer) -> NilClass {
         let name = name
             .unwrap_or_else(|_| raise_arg("type name must be a String"))
             .to_string();
         let specs = specs.unwrap_or_else(|_| raise_arg("constructor specs must be an Array"));
+        let scope = scope_arg(scope);
         let outcome = (|| -> Result<Result<(), CoreError>, String> {
             let mut cons = Vec::new();
             for spec in specs.into_iter() {
@@ -377,7 +406,8 @@ methods!(
                     handle: klass.value().value,
                 });
             }
-            let mut env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+            let mut scopes = SCOPES.lock().unwrap_or_else(|p| p.into_inner());
+            let env = scope_env(&mut scopes, scope)?;
             let r = env.register(&name, &cons);
             if r.is_ok() {
                 for c in &cons {
@@ -397,15 +427,17 @@ methods!(
         }
     },
     // render_pattern(src) -> canonical Haskell rendering (checks the pattern)
-    fn native_render_pattern(src: RString) -> RString {
+    fn native_render_pattern(src: RString, scope: Integer) -> RString {
         let src = src
             .unwrap_or_else(|_| raise_arg("pattern must be a String"))
             .to_string();
+        let scope = scope_arg(scope);
         let result = (|| -> Result<String, CoreError> {
             let raw = parse_pattern(&src)?;
-            let mut env = ENV.lock().unwrap_or_else(|p| p.into_inner());
-            let (pats, b) = resolve_clause(&mut env, &[raw])?;
-            Ok(render_pat(&env, &pats[0], &b.names))
+            let mut scopes = SCOPES.lock().unwrap_or_else(|p| p.into_inner());
+            let env = scope_env(&mut scopes, scope).unwrap_or_else(|m| raise_arg(&m));
+            let (pats, b) = resolve_clause(env, &[raw])?;
+            Ok(render_pat(env, &pats[0], &b.names))
         })();
         match result {
             Ok(s) => RString::new_utf8(&s),
@@ -438,12 +470,47 @@ methods!(
         MAX_DEPTH.store(n as usize, std::sync::atomic::Ordering::Relaxed);
         Integer::new(n)
     },
+    // parse_haskell(source) -> JSON string of the module AST
+    fn native_parse_haskell(src: RString) -> RString {
+        let src = src
+            .unwrap_or_else(|_| raise_arg("Haskell source must be a String"))
+            .to_string();
+        match crate::core::hs::parse_module(&src) {
+            Ok(m) => RString::new_utf8(&crate::core::hs::json::module(&m)),
+            Err(e) => raise_core(e),
+        }
+    },
+    // constructor_info(name) -> [type_name, arity, fields_or_nil] or nil
+    fn native_constructor_info(name: RString, scope: Integer) -> AnyObject {
+        let name = name
+            .unwrap_or_else(|_| raise_arg("constructor name must be a String"))
+            .to_string();
+        let scope = scope_arg(scope);
+        let mut scopes = SCOPES.lock().unwrap_or_else(|p| p.into_inner());
+        let env = scope_env(&mut scopes, scope).unwrap_or_else(|m| raise_arg(&m));
+        match env.lookup_con(&name) {
+            Some(c) => {
+                let con = env.con(c);
+                let mut row = Array::with_capacity(3);
+                row.push(RString::new_utf8(&env.ty(con.ty).name));
+                row.push(Integer::new(con.arity as i64));
+                match &con.fields {
+                    Some(fs) => row.push(rstrings(fs).to_any_object()),
+                    None => row.push(NilClass::new().to_any_object()),
+                };
+                row.to_any_object()
+            }
+            None => NilClass::new().to_any_object(),
+        }
+    },
     // constructors(type_name) -> [names] or nil
-    fn native_constructors(name: RString) -> AnyObject {
+    fn native_constructors(name: RString, scope: Integer) -> AnyObject {
         let name = name
             .unwrap_or_else(|_| raise_arg("type name must be a String"))
             .to_string();
-        let env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+        let scope = scope_arg(scope);
+        let mut scopes = SCOPES.lock().unwrap_or_else(|p| p.into_inner());
+        let env = scope_env(&mut scopes, scope).unwrap_or_else(|m| raise_arg(&m));
         match env.lookup_type(&name) {
             Some(t) => {
                 let names: Vec<String> = env
@@ -486,6 +553,7 @@ fn build(
     clauses: &Array,
     guarded: &Array,
     limit: usize,
+    scope: usize,
 ) -> Result<Built, BuildError> {
     let n = clauses.length();
     if n == 0 {
@@ -496,7 +564,8 @@ fn build(
             "guard flags must have one entry per clause".into(),
         ));
     }
-    let mut env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let mut scopes = SCOPES.lock().unwrap_or_else(|p| p.into_inner());
+    let env = scope_env(&mut scopes, scope).map_err(BuildError::Arg)?;
     let mut resolved: Vec<(Vec<crate::core::ast::Pat>, bool)> = Vec::with_capacity(n);
     let mut names: Vec<Vec<String>> = Vec::with_capacity(n);
     let mut guard_flags: Vec<bool> = Vec::with_capacity(n);
@@ -547,7 +616,7 @@ fn build(
             }
             _ => {}
         }
-        let (ps, b) = resolve_clause(&mut env, &raws)
+        let (ps, b) = resolve_clause(env, &raws)
             .map_err(|e| CoreError::new(e.kind, format!("clause {}: {}", i + 1, e.message)))?;
         let g = guarded.at(i as i64);
         let g = !(g.is_nil() || g.value().is_false());
@@ -558,12 +627,12 @@ fn build(
     let arity = arity.expect("at least one clause");
     let only_pats: Vec<Vec<crate::core::ast::Pat>> =
         resolved.iter().map(|(p, _)| p.clone()).collect();
-    typecheck::check(&env, &only_pats)?;
-    let analysis = exhaust::analyze(&env, &resolved, limit);
+    typecheck::check(env, &only_pats)?;
+    let analysis = exhaust::analyze(env, &resolved, limit);
     let missing: Vec<String> = analysis
         .missing
         .iter()
-        .map(|w| render_witness(&env, w))
+        .map(|w| render_witness(env, w))
         .collect();
     let clauses_for_tree: Vec<tree::Clause> = resolved
         .iter()
@@ -574,9 +643,9 @@ fn build(
             guarded: *g,
         })
         .collect();
-    let compiled = tree::compile(&env, &clauses_for_tree, arity);
+    let compiled = tree::compile(env, &clauses_for_tree, arity);
     let snapshot: TypeEnv = env.clone();
-    drop(env);
+    drop(scopes);
     let rt = runtime::translate(&snapshot, &compiled.tree);
     let mut lits = Vec::new();
     runtime::lazy_literals(&compiled.tree, &mut lits);
@@ -622,6 +691,7 @@ unsafe extern "C" fn matcher_new(
     clauses: Value,
     guarded: Value,
     limit: Value,
+    scope: Value,
 ) -> Value {
     let outcome = catch_unwind(AssertUnwindSafe(
         || -> Result<(AnyObject, Vec<String>, bool, Vec<usize>), BuildError> {
@@ -640,7 +710,14 @@ unsafe extern "C" fn matcher_new(
                 .map(|i| i.to_i64())
                 .unwrap_or(20)
                 .max(1) as usize;
-            let built = build(name, &clauses, &guarded, limit)?;
+            let scope = AnyObject::from(scope)
+                .try_convert_to::<Integer>()
+                .map(|i| i.to_i64())
+                .map_err(|_| BuildError::Arg("scope must be an Integer".into()))?;
+            if scope < 0 {
+                return Err(BuildError::Arg("scope must not be negative".into()));
+            }
+            let built = build(name, &clauses, &guarded, limit, scope as usize)?;
             let obj: AnyObject = Class::from(klass).wrap_data(built.matcher, &*MATCHER_TYPE);
             Ok((obj, built.missing, built.truncated, built.redundant))
         },
@@ -1041,9 +1118,12 @@ pub fn init() {
     }
     native.define(|m| {
         m.def_self("parse_data", native_parse_data);
-        m.def_self("register_type", native_register_type);
-        m.def_self("render_pattern", native_render_pattern);
-        m.def_self("constructors", native_constructors);
+        m.def_self("new_scope", native_new_scope);
+        m.def_self("register_type_in", native_register_type);
+        m.def_self("render_pattern_in", native_render_pattern);
+        m.def_self("constructors_in", native_constructors);
+        m.def_self("parse_haskell", native_parse_haskell);
+        m.def_self("constructor_info_in", native_constructor_info);
         m.def_self("stack_segment", native_stack_segment);
         m.def_self("stack_segment=", native_set_stack_segment);
         m.def_self("max_depth", native_max_depth);
@@ -1056,7 +1136,7 @@ pub fn init() {
     unsafe {
         let k = matcher.value();
         let new_name = CString::new("new").unwrap();
-        rclass::rb_define_singleton_method(k, new_name.as_ptr(), matcher_new as CallbackPtr, 4);
+        rclass::rb_define_singleton_method(k, new_name.as_ptr(), matcher_new as CallbackPtr, 5);
         def_method(k, "call", matcher_call as CallbackPtr, -1);
         def_method(k, "prepare", matcher_prepare as CallbackPtr, -1);
         def_method(k, "select", matcher_select as CallbackPtr, -1);

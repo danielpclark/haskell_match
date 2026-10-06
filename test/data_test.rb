@@ -69,6 +69,11 @@ class DataTest < Minitest::Test
     # `include Person` makes `Person` the constructor; the type is `::Person`
     assert_equal "data Person = Person {name, age}", ::Person.inspect
     assert_equal ::Person, Person.data_type
+    # the type module builds values through its same-named constructor
+    assert_equal Person.new("Al", 3), ::Person.new("Al", 3)
+    assert_equal Person.new("Al", 3), ::Person["Al", 3]
+    assert_equal Person.new("Al", 3), ::Person.("Al", 3)
+    assert_raises(NoMethodError) { ::Maybe.new(1) }
   end
 
   def test_records

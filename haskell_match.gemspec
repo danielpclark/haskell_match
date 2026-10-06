@@ -25,7 +25,7 @@ Gem::Specification.new do |spec|
     "ext/haskell_match/Cargo.lock",
     "ext/haskell_match/extconf.rb",
     "ext/haskell_match/src/**/*.rs",
-    "LICENSE-MIT", "LICENSE-APACHE", "README.md"
+    "LICENSE-MIT", "LICENSE-APACHE", "README.md", "CHANGELOG.md"
   ]
   spec.require_paths = ["lib"]
   spec.extensions = ["ext/haskell_match/extconf.rb"]

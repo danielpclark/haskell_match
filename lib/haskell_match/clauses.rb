@@ -31,7 +31,7 @@ module HaskellMatch
 
     # Add a clause: one pattern per argument, each either a Haskell pattern
     # string or a pattern written in place (see {PatternAST}).
-    def on(*patterns, guard: nil, where: nil, &body)
+    def on(*patterns, guard: nil, where: nil, location: nil, &body)
       guard ||= where
       raise DefinitionError, "a clause needs at least one pattern" if patterns.empty?
       raise DefinitionError, "a clause needs a body block" unless body
@@ -40,7 +40,7 @@ module HaskellMatch
       end
 
       texts = patterns.map { |p| p.is_a?(String) ? p.dup.freeze : PatternAST.render(p).freeze }
-      @clauses << Clause.new(texts.freeze, guard, body, body.source_location)
+      @clauses << Clause.new(texts.freeze, guard, body, location || body.source_location)
       self
     end
     alias clause on
@@ -124,7 +124,7 @@ module HaskellMatch
         @clauses
       end
 
-      def on(*patterns, guard: nil, where: nil, &body)
+      def on(*patterns, guard: nil, where: nil, location: nil, &body)
         guard ||= where
         raise DefinitionError, "a clause needs at least one pattern" if patterns.empty?
         raise DefinitionError, "a clause needs a body block" unless body
@@ -133,7 +133,7 @@ module HaskellMatch
         end
 
         texts = patterns.map { |p| p.is_a?(String) ? p.dup.freeze : PatternAST.render(p).freeze }
-        @clauses << Clause.new(texts.freeze, guard, body, body.source_location)
+        @clauses << Clause.new(texts.freeze, guard, body, location || body.source_location)
         self
       end
       alias clause on
@@ -180,7 +180,8 @@ module HaskellMatch
 
     # Returns [matcher, bodies, guards] where bodies/guards are arrays of
     # callables taking the bound values positionally.
-    def compile(name, clauses, exhaustive:, overlapping:, kind: "equation", klass: Native::Matcher)
+    def compile(name, clauses, exhaustive:, overlapping:, kind: "equation", klass: Native::Matcher,
+                scope: Native::GLOBAL_SCOPE)
       raise DefinitionError, "'#{name}' has no clauses" if clauses.empty?
 
       exhaustive = policy(exhaustive, :exhaustive)
@@ -189,7 +190,8 @@ module HaskellMatch
         name.to_s,
         clauses.map(&:patterns),
         clauses.map { |c| !c.guard.nil? && !c.guard.equal?(ClauseBuilder::OTHERWISE) },
-        WITNESS_LIMIT
+        WITNESS_LIMIT,
+        scope
       )
       report(name, kind, clauses, matcher, exhaustive, overlapping)
 

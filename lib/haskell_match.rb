@@ -20,6 +20,7 @@ end
 require_relative "haskell_match/version"
 require_relative "haskell_match/errors"
 require_relative "haskell_match/native_loader"
+require_relative "haskell_match/scope"
 
 HaskellMatch::NativeLoader.load!
 
@@ -34,3 +35,5 @@ require_relative "haskell_match/function"
 require_relative "haskell_match/case_of"
 require_relative "haskell_match/pattern"
 require_relative "haskell_match/dsl"
+require_relative "haskell_match/prelude"
+require_relative "haskell_match/haskell"

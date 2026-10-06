@@ -21,8 +21,8 @@ module HaskellMatch
       HaskellMatch.case_of(*values, **options, &definition)
     end
 
-    def pattern(source)
-      HaskellMatch.pattern(source)
+    def pattern(source = nil, **options, &block)
+      HaskellMatch.pattern(source, **options, &block)
     end
 
     def data(decl, **options)
@@ -32,11 +32,13 @@ module HaskellMatch
     # Define an instance method (when extended onto a class or module) or a
     # singleton method (when `self` is any other object) by clauses.  Clause
     # bodies and guards run with `self` set to the receiver.
-    def hdef(name, exhaustive: HaskellMatch.exhaustive, overlapping: HaskellMatch.overlapping, &definition)
+    def hdef(name, exhaustive: HaskellMatch.exhaustive, overlapping: HaskellMatch.overlapping,
+             scope: Native::GLOBAL_SCOPE, &definition)
       raise ArgumentError, "hdef needs a block with on(...) clauses" unless definition
 
       clauses = ClauseBuilder.collect(definition).clauses
-      matcher, _bodies, _guards = Compiler.compile(name, clauses, exhaustive: exhaustive, overlapping: overlapping)
+      matcher, _bodies, _guards = Compiler.compile(name, clauses, exhaustive: exhaustive, overlapping: overlapping,
+                                                                   scope: scope)
       names = matcher.names
       guards = clauses.map { |c| c.guard.equal?(ClauseBuilder::OTHERWISE) ? nil : c.guard }
       plans = clauses.each_with_index.map do |c, i|

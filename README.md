@@ -387,6 +387,120 @@ Together these give Ruby the two things Haskell relies on for "infinite"
 programs: loops that do not consume stack, and data that does not have to
 exist before it is asked for.
 
+## Or simply write Haskell
+
+Everything above is Haskell's pattern matching with Ruby expressions in the
+clause bodies. When a function is clearer in Haskell itself, write it in
+Haskell. `HaskellMatch.haskell` compiles a Haskell 2010 subset (data
+declarations, equations, guards, `where`, `let`, `case`, lambdas, sections,
+list comprehensions, ranges, and a lazy Prelude) into methods on a Ruby
+module, with the same exhaustiveness and redundancy checks as everything
+else in this library:
+
+```ruby
+Shapes = HaskellMatch.haskell(<<~HS)
+  data Shape = Circle Double | Rect Double Double
+
+  area :: Shape -> Double
+  area (Circle r) = 3 * r * r
+  area (Rect w h) = w * h
+
+  describe :: Shape -> String
+  describe s
+    | a > 10 = "big " ++ kind
+    | otherwise = "small " ++ kind
+    where
+      a = area s
+      kind = case s of
+        Circle _ -> "circle"
+        Rect w h | w == h -> "square"
+                 | otherwise -> "rectangle"
+
+  totalArea :: [Shape] -> Double
+  totalArea = sum . map area
+HS
+
+shapes = [Shapes::Circle.new(1.0), Shapes::Rect.new(2.0, 2.0), Shapes::Rect.new(3.0, 5.0)]
+shapes.map { |s| Shapes.describe(s) }  # => ["small circle", "small square", "big rectangle"]
+Shapes.total_area(shapes)              # => 22.0
+```
+
+Haskell names arrive as Ruby methods (`totalArea` is also `total_area`),
+constructors as constants, and the recursion and laziness machinery is the
+one described above: `where` helpers that call themselves in tail position
+run in constant space, and a list built with `:` is as lazy as Haskell's, so
+the classic infinite definitions work unchanged.
+
+```ruby
+Nums = HaskellMatch.haskell(<<~HS)
+  primes :: [Int]
+  primes = sieve [2..]
+    where
+      sieve [] = []
+      sieve (p:xs) = p : sieve [x | x <- xs, x `mod` p /= 0]
+
+  fibs :: [Integer]
+  fibs = 0 : 1 : zipWith (+) fibs (tail fibs)
+
+  sumTo :: Int -> Int
+  sumTo n = go n 0
+    where
+      go 0 acc = acc
+      go k acc = go (k - 1) (acc + k)
+HS
+
+Nums.primes.take(8)    # => [2, 3, 5, 7, 11, 13, 17, 19]
+Nums.fibs.take(10)     # => [0, 1, 1, 2, 3, 5, 8, 13, 21, 34]
+Nums.sum_to(1_000_000) # => 500000500000
+```
+
+The two languages call each other freely. A name the Haskell does not define
+is a Ruby method of the host module, so Haskell can lean on Ruby for
+formatting, I/O or anything else; and Ruby can match on the module's types
+with the module's own `fn`, `case_of` and `pattern`, in either pattern
+dialect:
+
+```ruby
+module Report
+  def self.money(x)
+    format("$%.2f", x)
+  end
+
+  extend HaskellMatch::Haskell
+  haskell <<~HS
+    data Line = Line String Double Int
+
+    total :: [Line] -> Double
+    total ls = sum [price * fromIntegral qty | Line _ price qty <- ls]
+
+    summary :: [Line] -> String
+    summary [] = "nothing ordered"
+    summary ls = show (length ls) ++ " lines, " ++ money (total ls)
+  HS
+end
+
+order = [Report::Line.new("tea", 2.5, 2), Report::Line.new("cake", 4.0, 1)]
+Report.summary(order)   # => "2 lines, $9.00"
+Report.summary([])      # => "nothing ordered"
+
+label = Report.fn(:label) do
+  on(Line(name, _, 1))   { |name| name }
+  on("Line name _ qty")  { |name, qty| "#{qty} x #{name}" }
+end
+order.map { |l| label.(l) }   # => ["2 x tea", "cake"]
+```
+
+And a Haskell file is just a Haskell file. `HaskellMatch.require` finds
+`name.hs` on the load path (or takes a path) and defines a constant named
+after its `module` header; `HaskellMatch.load` returns an anonymous module.
+No templating and no interpolation: the file is the Haskell 2010 subset
+described in [Inline Haskell and `.hs` files](#inline-haskell-and-hs-files).
+
+```ruby
+HaskellMatch.require "examples/geometry"   # examples/geometry.hs: `module Geometry where ...`
+Geometry.describe(Geometry::Triangle.new(3.0, 4.0, 5.0))   # => "small triangle"
+```
+
 ## At a glance
 
 * **Haskell pattern syntax**, quoted or written in place: constructors,
@@ -408,6 +522,8 @@ exist before it is asked for.
   tails as shared slices.
 * **Thread-, fiber- and Ractor-safe**, with `ractor: true` producing
   shareable functions.
+* **Haskell itself**, inline or from `.hs` files: a Haskell 2010 subset
+  compiled to Ruby methods, with a lazy Prelude and two-way interop.
 
 ## Installation
 
@@ -464,7 +580,8 @@ so `include Maybe` brings `Just` and `Nothing` into scope.
 Haskell keeps types and constructors in different namespaces; Ruby does not.
 For `data Person = Person {...}`, after `include Person` the name `Person`
 refers to the constructor; the type module is `::Person` or
-`Person.data_type`.
+`Person.data_type`. The type module forwards `new`, `[]` and `call` to a
+same-named constructor, so `Person.new("Al", 3)` builds a person either way.
 
 ## Patterns
 
@@ -721,6 +838,104 @@ class Account
   end
 end
 ```
+
+## Inline Haskell and `.hs` files
+
+`HaskellMatch.haskell(source)` compiles Haskell source into a module and
+returns it; `into: SomeModule` compiles into an existing one, and inside a
+module body `extend HaskellMatch::Haskell` gives a `haskell` method that
+does the same. `HaskellMatch.load(path)` compiles a file into a fresh
+module; `HaskellMatch.require(name)` finds `name.hs` on `$LOAD_PATH` (or
+takes a path), compiles it once, and defines a constant for it named after
+the file's `module` header (`module Data.Tree where` becomes `Data::Tree`)
+or, without one, the camel-cased file name.
+
+```ruby
+Geometry = HaskellMatch.load("examples/geometry.hs")
+HaskellMatch.require "lists"               # lists.hs somewhere on $LOAD_PATH -> Lists
+HaskellMatch.require "lib/hs/tree", under: MyApp   # -> MyApp::Tree (or its module header)
+```
+
+Write the source in a heredoc; use a quoted heredoc (`<<~'HS'`) when the
+Haskell contains backslashes (lambdas) so Ruby leaves them alone.
+
+### The supported language
+
+The front end is a Haskell 2010 parser with the layout rule, so ordinary
+Haskell formatting works. Supported:
+
+* `data` declarations, positional or with record fields, with `deriving`
+  (accepted; `Eq` and `Show` behaviour comes for free from the Ruby values);
+  `type` signatures (accepted and ignored: Ruby is the type system here);
+  `module ... where` headers and `import`s (accepted and ignored: the
+  Prelude is always in scope).
+* Function equations with any patterns this library supports (constructors,
+  literals, negative literals, characters, strings, lists, tuples, `_`,
+  as-patterns, lazy and bang patterns, records), guards with `otherwise`,
+  `where` bindings (functions, values and pattern bindings, nested
+  arbitrarily), `let ... in`, `case ... of` with guards, `if/then/else`.
+* Expressions: application and partial application, operators with the
+  Prelude's fixities, backtick operators, sections (`(*2)`, `` (`div` 2) ``,
+  `subtract 1`), operator values (`(+)`), `$`, `.`, lambdas (including
+  pattern lambdas), tuples, list literals, ranges (`[1..n]`, `[1,3..]`,
+  `[0..]`), list comprehensions with generators, guards and `let`.
+* Names: `camelCase` functions get a `snake_case` alias; a trailing prime
+  becomes `_prime` (`foldl'` is callable as `foldl_prime`).
+* Top-level values (`primes = ...`) become memoised methods; a value of
+  function type can still be called with arguments from Ruby
+  (`Mod.from_list([1, 2])` when `fromList = foldr insert Leaf`).
+
+Out of scope, by design: type classes (`class`/`instance`), `do` notation
+and monads, operator definitions, and anything needing type inference.
+They are rejected with a clear message.
+
+### Semantics worth knowing
+
+* **Strictness.** Compiled code is strict (it is Ruby), with one deliberate
+  exception: the tail of `x : e` is deferred when `e` is a computation
+  rather than a variable or literal. That is exactly what makes
+  `p : sieve xs` and `fibs = 0 : 1 : zipWith (+) fibs (tail fibs)` work. A
+  list built that way is a `LazyList` (`to_a` materialises it, `==`
+  compares elements); a list built from a variable tail (`toUpper c : cs`)
+  keeps its input's type, so Strings stay Strings and Arrays stay Arrays.
+* **Lists are Arrays, Strings or LazyLists**, exactly as for patterns.
+  Prelude functions accept all three and stay lazy when their input is.
+  Ranges are Arrays when bounded and lazy when not.
+* **Recursion** compiles to the same machinery as `HaskellMatch.fn`: calls
+  in tail position use `tail` (constant space), everything else uses the
+  segmented stack, and `HaskellMatch.max_depth` applies.
+* **Exhaustiveness and redundancy** are enforced for every function,
+  including `where`/`let` helpers, `case` expressions and pattern lambdas,
+  with the policy you pass as `exhaustive:` (default
+  `HaskellMatch.exhaustive`). Errors name the Haskell function and the line
+  of the Ruby file (or `.hs` file) it came from.
+* **Type scopes.** Each compiled module gets its own type scope: a snapshot
+  of the global `HaskellMatch.data` registry when the module is first
+  compiled plus its own `data` declarations, so two modules can both declare
+  a `Shape`. Ruby code matches on a module's types through the module's
+  `fn`, `case_of`, `pattern` and `data` methods, which take the same
+  options as `HaskellMatch`'s. Types you want to share between Ruby and
+  Haskell are simplest declared globally with `HaskellMatch.data` before
+  the module is compiled.
+* **Interop.** A name the Haskell does not define (and the Prelude does not
+  provide) is called as a method of the host module, so a module can mix
+  `def self.helper` with Haskell that calls `helper`. Ruby lambdas, Procs
+  and Methods are Haskell functions (`Mod.my_map(->(x) { x * 2 }, [1, 2])`),
+  and the compiled `Function` objects are available as
+  `Mod.haskell_functions` / `Mod.haskell_function(:name)` for `tail`,
+  `to_proc`, `===` and `decision_tree`.
+* **The Prelude** lives in `HaskellMatch::Prelude` and is callable from
+  Ruby too (`HaskellMatch::Prelude.take(3, xs)`). It provides the standard
+  types `Maybe`, `Either` and `Ordering` (`HaskellMatch::Prelude::Maybe::Just`)
+  and the usual functions: `map`, `filter`, `foldr`, `foldl`, `zip`,
+  `zipWith`, `take`, `drop`, `takeWhile`, `iterate`, `repeat`, `cycle`,
+  `sum`, `product`, `length`, `reverse`, `concat`, `concatMap`, `elem`,
+  `lookup`, `words`, `lines`, `show`, `fromIntegral`, `div`, `mod`,
+  `compare`, `maybe`, `fromMaybe`, `either`, `error`, `undefined`, the
+  `Data.Char` basics and more. `HaskellMatch::Prelude::ARITY.keys` lists
+  them all.
+* **Debugging.** `HaskellMatch::Haskell.generated_ruby(mod)` returns the
+  Ruby a module was compiled to.
 
 ## Deep and infinite recursion: expert notes
 
