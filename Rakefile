@@ -50,6 +50,11 @@ Rake::TestTask.new(:test) do |t|
 end
 task test: :compile
 
+desc "Run the README introduction's examples and check their results"
+task doctest: :compile do
+  ruby "-Ilib", "test/support/doctest.rb", "README.md"
+end
+
 desc "Run the Ruby benchmarks"
 task bench: :compile do
   ruby "-Ilib", "bench/bench.rb"
@@ -62,4 +67,4 @@ task :clean do
 end
 
 desc "Run Rust and Ruby tests"
-task default: ["cargo:test", :test]
+task default: ["cargo:test", :test, :doctest]
