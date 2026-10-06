@@ -294,7 +294,9 @@ stack does, with three mechanisms:
 segment cost) raises `HaskellMatch::StackOverflowError` beyond that depth, so
 a runaway recursion fails instead of taking the machine's memory; set it
 higher, or to 0 for no limit, when a computation legitimately needs more.
-Tail calls do not count towards the depth.
+Tail calls do not count towards the depth. The section "Deep and infinite
+recursion: expert notes" below gives the measured costs and the semantics at
+segment boundaries.
 
 ### Lazy lists
 
@@ -393,6 +395,185 @@ class Account
     on("Just amt")  { |amt| raise ArgumentError, "over limit: #{amt}" }
   end
 end
+```
+
+## Deep and infinite recursion: expert notes
+
+This section is for readers who intend to recurse hundreds of thousands or
+millions of levels deep, or to iterate forever, and want to know exactly what
+happens underneath. The short version: haskell_match gives you GHC's
+behaviour (recursion limited by memory, loops in constant space) on top of a
+VM whose stack is fixed, and the price of that is paid in memory and in the
+GC. Every number below was measured on Ruby 3.3.6, x86-64 Linux, with the
+default settings; reproduce them with the snippets at the end.
+
+### What a call costs on the stacks
+
+A call `f.(x)` enters the native `call` method (one Ruby control frame for the
+C function), matches `x` against the decision tree with no allocation, and
+invokes the selected clause body with `rb_proc_call_with_block`. The body is
+a Ruby block, so it gets a second control frame. If the body itself calls
+`f.(y)`, the whole sequence nests. Each level therefore consumes:
+
+* **Ruby VM stack**: two control frames (the C-function frame and the block
+  frame) plus the block's locals and operand stack, roughly 150–300 bytes.
+* **Machine (C) stack**: the native method's own frame, the VM re-entry
+  (`vm_exec`) that runs the block, and the Rust matcher's scratch space,
+  roughly a kilobyte.
+
+Ruby sizes both stacks when a thread or fiber is created and never grows
+them: 1 MB VM / 1 MB machine for a thread, 128 KB VM / 512 KB machine for a
+fiber (`RubyVM::DEFAULT_PARAMS`). A plain Ruby lambda that recurses with one
+frame per level dies at about 11,000 levels on the main thread; a clause body
+with two frames per level would die at about 7,000; inside a fiber, at about
+480. Nothing at run time can enlarge an existing stack, which is why the
+mechanisms below exist.
+
+### Mechanism 1: stack segments (what plain recursion uses)
+
+The native `call` keeps a per-thread nesting counter. When a body is about to
+run at a depth that is a multiple of `HaskellMatch.stack_segment` (default
+100), the body is run inside a brand-new Fiber instead of on the current
+stack. That Fiber has fresh 128 KB / 512 KB stacks; the recursion continues
+in it until another 100 levels, when the next segment is started. Segments
+form a linked chain of suspended fibers, each waiting for the inner one's
+result, which is exactly the shape of a growable stack.
+
+Facts about segments:
+
+* **Default 100 is deliberate.** A single fiber holds about 480 plain levels;
+  bodies that call a few helper methods per level use more VM stack, so 100
+  leaves a safety factor of four to five. Raising `stack_segment` lowers the
+  memory per level (fewer, fuller fibers) but narrows that margin: 400 and
+  above overflow a fiber with even the simplest body. Lowering it is always
+  safe and only costs memory and fiber creations.
+* **Memory per level: about 1.6 KB.** Each segment commits its 128 KB fiber
+  VM stack in full (the VM touches both ends of it), so the per-level cost is
+  dominated by `128 KB / stack_segment`, not by the frames themselves. 200k
+  levels peak at about 300 MB; 1M levels at about 1.6 GB. GHC, by comparison,
+  spends about 24 bytes per level of `1 + length xs`. The shape is the same
+  as Haskell's (non-tail recursion is linear in depth); the constant is about
+  sixty times worse.
+* **Memory is reclaimed, lazily.** When the outermost call returns, every
+  segment fiber has finished and is unreferenced; the Fiber objects are
+  collected at the next GC and their stacks go back to Ruby's fiber pool,
+  which marks the pages `MADV_FREE`. The kernel reclaims those pages under
+  memory pressure, so RSS stays high after a deep call even though the
+  memory is available (`LazyFree` in `/proc/self/smaps_rollup` shows it:
+  288 MB of a 325 MB RSS after a 200k-deep call). Repeated deep calls reuse
+  the pooled stacks and do not grow RSS further. This is not a leak; it is
+  the pool keeping what it once needed.
+* **First call is slow, later calls are fast.** Committing fresh fiber stacks
+  page-faults every page: the first 400k-deep call took 3.2 s, the second
+  0.6 s, the third 0.35 s (0.9 µs per level); at 1M depth, 8.9 s then 2.8 s.
+  Budget for the cold run if a deep recursion happens once.
+* **GC cost grows with live depth.** A GC that runs while the recursion is
+  pending must mark every live fiber stack, so a collection costs O(depth)
+  and a deep computation that allocates heavily pays that repeatedly.
+  `GC.disable` around a known deep computation, or a larger
+  `RUBY_GC_HEAP_INIT_SLOTS`, removes that term.
+* **Semantics across a segment boundary.** Exceptions propagate normally
+  (`rb_fiber_resume` re-raises them in the parent), but the backtrace only
+  covers the innermost segment. Non-local exits do not cross: `throw` to a
+  `catch` outside the segment raises `UncaughtThrowError`, and `break` or
+  `return` out of a body proc raises `LocalJumpError` at the boundary.
+  Within 100 levels of the `catch`, everything behaves as in one stack.
+  `Fiber.yield` inside a body yields the segment fiber, not yours.
+* **Threads and Ractors.** The depth counter is per OS thread, so each Ruby
+  Thread and each Ractor recurses independently. If your own Fiber runs a
+  deep recursion, the counter is shared with the thread that created it; the
+  only effect is that segments may start a little earlier than needed.
+
+### Mechanism 2: tail calls (constant space)
+
+```ruby
+go = HaskellMatch.fn(:go) do
+  on(acc, [])        { |acc| acc }
+  on(acc, [x, *xs])  { |acc, x, xs| go.tail(acc + x, xs) }
+end
+```
+
+`go.tail(args...)` returns a `HaskellMatch::TailCall` marker. The native
+`call` sees it, replaces the current arguments with the marker's and matches
+again on the same frame; nothing is pushed on any stack and nothing counts
+towards `max_depth`. The target may be a different function, so mutual
+recursion (`even`/`odd`) loops in constant space too. Cost: one small `Data`
+allocation per iteration, about 1.1 µs per level including the list slice
+(a shared, copy-on-write subarray). This is the right tool for anything that
+is a loop in Haskell: accumulators, folds, state machines, servers. A marker
+returned anywhere but as the body's final value is just a value (`go.tail(1)`
+outside a call is an ordinary object).
+
+### Mechanism 3: deferred calls (cheap depth)
+
+```ruby
+length = HaskellMatch.fn(:length) do
+  on([])        { 0 }
+  on([_, *xs])  { |xs| length.defer(xs) { |n| 1 + n } }    # 1 + length xs
+end
+```
+
+`f.defer(args...) { |result| ... }` is a tail call that carries a
+continuation. The native `call` pushes the block on a Ruby array it owns and
+continues with the call; when a body finally returns an ordinary value, the
+pending blocks are applied to it last-in first-out, each possibly returning
+another marker. The recursion's stack is that array, on the heap, so it is
+bounded by memory alone and `max_depth` never triggers: 2M levels completed
+in 31 s at 770 MB. Per level it costs one Proc plus its environment (about
+200–400 bytes) and about 4 µs, of which about 20% is GC marking the growing
+array (1M levels: 5.4 s with GC on, 4.3 s with GC off). Prefer `defer` over
+plain recursion when depth is known to be large and memory matters; prefer
+plain recursion when it is not, since `defer` requires writing the
+continuation by hand and runs the continuation outside the body's frame
+(`self` and closure variables are those of the block, as usual).
+
+### The depth guard
+
+`HaskellMatch.max_depth` (default 250,000) bounds the nesting counter from
+mechanism 1. Past it, the next nested call raises
+`HaskellMatch::StackOverflowError` instead of allocating another segment. At
+1.6 KB per level the default corresponds to about 400 MB, the point of the
+limit being that a runaway recursion fails loudly rather than exhausting the
+machine, which is what GHC's stack limit (80% of RAM by default) is for too.
+Set it higher or to 0 (unlimited) for a computation that legitimately needs
+more; `tail` and `defer` never count towards it. The counter is restored
+exactly even when a body leaves by exception, so a caught error deep in a
+recursion does not shift later limits.
+
+### Choosing
+
+| Pattern of recursion                      | Use                      | Space       | Time per level (warm) |
+|-------------------------------------------|--------------------------|-------------|-----------------------|
+| Loop with accumulator, fold, state machine| `f.tail(...)`            | O(1)        | ~1.1 µs               |
+| Deep non-tail recursion, depth known large| `f.defer(...) { }`       | ~300 B/level| ~4 µs                 |
+| Ordinary recursion, depth moderate        | plain `f.(...)`          | ~1.6 KB/level (≤ `max_depth`) | ~0.9 µs (first call slower) |
+| Infinite data                             | `HaskellMatch.lazy` + patterns | per element forced | per element |
+
+Infinite recursion in the Haskell sense, a producer that never returns, is
+expressed as a lazy list consumed by `tail`-recursive or bounded consumers:
+`take.(n, HaskellMatch::LazyList.iterate(1) { |x| x * 2 })` forces exactly
+`n` cells and no more, and each forced cell is memoised, so sharing works as
+in Haskell (two consumers of the same list see the same elements, computed
+once). An Enumerator passed directly is re-wrapped on each call, iterating
+from its start, which keeps calls referentially transparent at the cost of
+recomputing from scratch per call; keep a `LazyList` in a variable when the
+elements are expensive.
+
+### Reproducing the measurements
+
+```ruby
+require "haskell_match"
+HaskellMatch.max_depth = 0
+count = HaskellMatch.fn(:count) { on("[]") { 0 }; on("(_:xs)") { |xs| 1 + count.(xs) } }
+dlen  = HaskellMatch.fn(:dlen)  { on("[]") { 0 }; on("(_:xs)") { |xs| dlen.defer(xs) { |n| 1 + n } } }
+go    = HaskellMatch.fn(:go)    { on("acc", "[]") { |acc| acc }; on("acc", "(x:xs)") { |acc, x, xs| go.tail(acc + x, xs) } }
+
+rss = -> { File.read("/proc/self/status")[/VmRSS:\s+(\d+)/, 1].to_i / 1024 }
+list = (1..200_000).to_a
+before = rss.(); count.(list); puts "segments: +#{rss.() - before} MB"   # ~300 MB, ~1.6 KB/level
+before = rss.(); dlen.(list);  puts "defer:    +#{rss.() - before} MB"   # ~45 MB
+before = rss.(); go.(0, list); puts "tail:     +#{rss.() - before} MB"   # ~0 MB
+GC.start; puts File.read("/proc/self/smaps_rollup")[/LazyFree:.*/]     # reclaimable pages
 ```
 
 ## Errors
