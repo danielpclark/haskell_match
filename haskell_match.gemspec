@@ -16,7 +16,7 @@ Gem::Specification.new do |spec|
     accounted for before the first call.
   DESC
   spec.homepage = "https://github.com/danielpclark/haskell_match"
-  spec.license = "MIT OR Apache-2.0"
+  spec.licenses = ["MIT", "Apache-2.0"]
   spec.required_ruby_version = ">= 3.2"
 
   spec.files = Dir[
