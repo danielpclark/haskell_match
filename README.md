@@ -16,6 +16,14 @@ Haskell's pattern matching for Ruby, implemented in Rust with
   pattern of the function could accept raises a type-mismatch error (the
   error Haskell's type checker would have given), while `_` and variables
   match anything, exactly as in Haskell.
+* **Patterns with or without quotes.** Write Haskell syntax in a string, or
+  write the pattern in place as Ruby: `on([x, *xs])`, `on(Just(Just(_)))`,
+  `on(Person(name: n))`. Both forms build the same pattern and can be mixed.
+* **Lazy lists.** `(x:xs)` patterns match `HaskellMatch.lazy(1..)` and Ruby
+  Enumerators, so infinite lists work as they do in Haskell.
+* **Recursion without Ruby's stack limit.** Plain recursion is carried across
+  chained Fiber stacks, tail calls run in constant space, and a depth guard
+  turns a runaway recursion into an error instead of exhausted memory.
 * **Fast.** Clauses are compiled once (Maranget-style) into a decision tree
   that inspects each argument position at most once per path, and matching
   runs in Rust directly over Ruby `VALUE`s with no allocation until a clause
@@ -47,6 +55,12 @@ length = HaskellMatch.fn(:length) do
   on("(_:xs)") { |xs| 1 + length.(xs) }
 end
 length.([1, 2, 3])            # => 3
+
+# the same, with the patterns written in place
+length = HaskellMatch.fn(:length) do
+  on([])        { 0 }
+  on([_, *xs])  { |xs| 1 + length.(xs) }
+end
 ```
 
 Leave a case out and the definition fails, exactly where Haskell would warn:
@@ -171,6 +185,37 @@ g = HaskellMatch.fn(:g) { on("Just x") { |x| x }; on("Nothing") { 0 } }
 g.(5)           # TypeMismatchError: expected a value of type Maybe but got 5 (Integer)
 ```
 
+### Patterns without quotes
+
+Inside a definition block the pattern can be written as a Ruby expression.
+Bare lower-case names are variables, `_` is the wildcard, and the expression
+is rendered to the Haskell syntax above and compiled identically, so
+exhaustiveness checks, errors and speed are the same. Quoted and in-place
+patterns can be mixed, even within one clause.
+
+| In place                       | Haskell                     |
+|--------------------------------|-----------------------------|
+| `x`, `_`, `var(:name)`         | `x`, `_`, `name` (`var` for a name taken by a method or local) |
+| `Just(x)`, `Just[x]`, `Nothing`| `Just x`, `Nothing`         |
+| `Node(Leaf, v, Node(_, _, _))` | `Node Leaf v (Node _ _ _)`  |
+| `Person(name: n, age: _)`      | `Person { name = n, age = _ }` |
+| `Person(name: n, **_)`         | `Person { name = n, .. }`   |
+| `[]`, `[a, b]`                 | `[]`, `[a, b]`              |
+| `[x, *xs]`, `cons(x, xs)`      | `(x:xs)`                    |
+| `[x, y, *_]`                   | `(x:y:_)`                   |
+| `tuple(a, b)`, `unit`          | `(a, b)`, `()`              |
+| `as(all, [x, *_])`             | `all@(x:_)`                 |
+| `lazy(tuple(a, b))`, `bang(x)` | `~(a, b)`, `!x`             |
+| `0`, `-1`, `1.5`, `true`, `:ok`| `0`, `-1`, `1.5`, `True`, `:ok` |
+| `str("abc")`, `char("c")`      | `"abc"`, `'c'`              |
+
+A String handed directly to `on` is quoted pattern syntax (`on("Just x")`);
+inside a pattern a Ruby String is a string literal (`Just("abc")`), and
+`str("abc")` makes one at the top level. A bare name that is also a method
+of the enclosing object (or a local variable) is not a pattern variable;
+use `var(:name)` for it. `HaskellMatch.pattern { Just([x, *_]) }` builds a
+standalone pattern the same way.
+
 ### Guards
 
 ```ruby
@@ -206,26 +251,72 @@ A function is in scope inside its own clauses under its name, and as `recur`:
 
 ```ruby
 fact = HaskellMatch.fn(:fact) do
-  on("0") { 1 }
-  on("n") { |n| n * fact.(n - 1) }         # or recur.(n - 1)
+  on(0) { 1 }
+  on(n) { |n| n * fact.(n - 1) }         # or recur.(n - 1)
 end
 ```
 
-Non-tail recursion uses Ruby's VM stack: each level costs a dispatch frame
-plus the body's frame, so the depth limit is about half that of an inlined
-Ruby lambda (roughly 6,000 levels with Ruby's default 1 MB VM stack; raise
-`RUBY_THREAD_VM_STACK_SIZE` to go deeper). Tail calls run in constant space,
-as Haskell loops do: return `function.tail(args...)` from a clause body and
-the call continues with those arguments without growing the stack, including
-between different functions:
+Ruby's VM stack is fixed in size, so plain recursion written in Ruby dies at
+roughly 10,000 levels. haskell_match removes that limit the way GHC's growable
+stack does, with three mechanisms:
+
+* **Stack segments (automatic).** Every `HaskellMatch.stack_segment` nested
+  calls (default 100) the next clause body runs in a fresh Fiber, which brings
+  its own VM and machine stacks. `1 + length.(xs)` therefore recurses as deep
+  as memory allows with no change to the code. The cost is about 1.6 KB per
+  level (each segment commits a 128 KB fiber VM stack), reclaimed when the
+  call returns. Non-local exits (`throw`, `break`) do not cross segment
+  boundaries.
+* **Tail calls (constant space).** Return `function.tail(args...)` from a
+  body and the call continues with those arguments on the same frame, like a
+  Haskell loop:
+
+  ```ruby
+  sum = HaskellMatch.fn(:sum) do
+    on(acc, [])        { |acc| acc }
+    on(acc, [x, *xs])  { |acc, x, xs| sum.tail(acc + x, xs) }
+  end
+  sum.(0, (1..1_000_000).to_a)   # => 500000500000
+  ```
+* **Deferred calls (cheap depth).** `function.defer(args...) { |result| ... }`
+  stands for a non-tail call whose result the block receives; the pending
+  blocks are kept on a heap-backed stack managed natively, at about 200 bytes
+  per level:
+
+  ```ruby
+  length = HaskellMatch.fn(:length) do
+    on([])        { 0 }
+    on([_, *xs])  { |xs| length.defer(xs) { |n| 1 + n } }   # 1 + length xs
+  end
+  ```
+
+`HaskellMatch.max_depth` (default 250,000 nested calls, about 400 MB at the
+segment cost) raises `HaskellMatch::StackOverflowError` beyond that depth, so
+a runaway recursion fails instead of taking the machine's memory; set it
+higher, or to 0 for no limit, when a computation legitimately needs more.
+Tail calls do not count towards the depth.
+
+### Lazy lists
+
+`HaskellMatch.lazy(enumerable)` builds a memoised lazy list; list patterns
+match it element by element, forcing only what they inspect, so infinite
+lists work as in Haskell. Ruby Enumerators (including `Enumerator::Lazy`)
+given to a function are wrapped automatically, iterating from the start each
+time.
 
 ```ruby
-sum = HaskellMatch.fn(:sum) do
-  on("acc", "[]")     { |acc| acc }
-  on("acc", "(x:xs)") { |acc, x, xs| sum.tail(acc + x, xs) }
+take = HaskellMatch.fn(:take) do
+  on(0, _)         { [] }
+  on(_, [])        { [] }
+  on(n, [x, *xs])  { |n, x, xs| [x] + take.(n - 1, xs) }
 end
-sum.(0, (1..1_000_000).to_a)   # => 500000500000
+take.(5, HaskellMatch.lazy(1..))                       # => [1, 2, 3, 4, 5]
+take.(4, HaskellMatch::LazyList.iterate(1) { |x| x * 2 })   # => [1, 2, 4, 8]
+take.(3, (1..).lazy.map { |x| x * x })                 # => [1, 4, 9]
 ```
+
+`LazyList` is Enumerable and offers `head`, `tail`, `take(n)`, `empty?`, plus
+constructors `iterate`, `repeat`, `range`, `generate` and `empty`.
 
 ### Clause bodies and `self`
 
@@ -319,7 +410,8 @@ Match time (`HaskellMatch::MatchError`): `MatchError` itself for a partial
 function with no matching clause, `TypeMismatchError` when a value is of a
 type no pattern of the function can accept (`expected a value of type Maybe
 but got 5 (Integer)`), `IrrefutablePatternError` when a `~` pattern fails to
-destructure. Wrong argument counts raise `ArgumentError`.
+destructure. `HaskellMatch::StackOverflowError` is raised past
+`HaskellMatch.max_depth`. Wrong argument counts raise `ArgumentError`.
 
 Exceptions raised in bodies and guards propagate unchanged, with their
 backtraces; `throw`, `return` and `next` behave as in any block.
@@ -378,7 +470,11 @@ Array per `(x:xs)` tail that is bound.
   of unmatched patterns, including literal positions (`p1 where p1 is not one
   of {0, 1}`).
 * `core::tree` — compilation to a decision tree over numbered value slots.
-* `ruby::runtime` — evaluation over Ruby values; `ruby` — the `Native` module.
+* `ruby::runtime` — evaluation over Ruby values, including Strings and lazy
+  lists viewed as lists; `ruby` — the `Native` module, the trampoline that
+  handles `tail`/`defer` markers and the Fiber-segmented recursion.
+* `lib/haskell_match/pattern_ast.rb` — the in-place pattern syntax, rendered
+  to Haskell text; `lazy_list.rb` — memoised lazy lists.
 
 The pure core has its own `cargo test` suite; the Ruby suite covers the
 public API, GC stress, threads and Ractors.

@@ -64,4 +64,7 @@ module HaskellMatch
   # An irrefutable (`~`) pattern failed to destructure after its clause was
   # selected.
   class IrrefutablePatternError < MatchError; end
+
+  # Recursion through compiled functions exceeded `HaskellMatch.max_depth`.
+  class StackOverflowError < Error; end
 end

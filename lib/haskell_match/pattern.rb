@@ -10,7 +10,12 @@ module HaskellMatch
   class Pattern
     attr_reader :source, :names
 
-    def initialize(source)
+    def initialize(source = nil, &block)
+      if block
+        raise ArgumentError, "pass either a pattern string or a block, not both" if source
+
+        source = PatternAST.render(ClauseBuilder.new(block.binding.receiver).instance_exec(&block))
+      end
       raise ArgumentError, "pattern must be a String" unless source.is_a?(String)
 
       @source = source.dup.freeze
@@ -58,8 +63,9 @@ module HaskellMatch
   end
 
   class << self
-    def pattern(source)
-      Pattern.new(source)
+    # `HaskellMatch.pattern("Just (x:_)")` or `HaskellMatch.pattern { Just([x, *_]) }`
+    def pattern(source = nil, &block)
+      Pattern.new(source, &block)
     end
     alias [] pattern
   end

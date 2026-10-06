@@ -8,9 +8,12 @@ module HaskellMatch
   #     on("(_:xs)") { |xs| 1 + length.(xs) }
   #   end
   #   length.([1, 2, 3])  # => 3
-  # Returned by {Function#tail}: tells the native `call` to continue with
-  # `function` applied to `args` instead of growing the stack.
-  TailCall = Data.define(:function, :args)
+  # Returned by {Function#tail} and {Function#defer}: tells the native `call`
+  # to continue with `function` applied to `args`, and (for `defer`) to pass
+  # the eventual result to `continuation`.  The native call keeps pending
+  # continuations on its own stack, so recursion written this way is bounded
+  # by memory rather than by Ruby's VM stack.
+  TailCall = Data.define(:function, :args, :continuation)
 
   class Function < Native::Matcher
     attr_reader :clauses
@@ -19,7 +22,16 @@ module HaskellMatch
     # expression of a clause body re-enters the function (or any other
     # function) in constant stack space, like a tail call in Haskell.
     def tail(*args)
-      TailCall.new(self, args)
+      TailCall.new(self, args, nil)
+    end
+
+    # Request a non-tail call whose result the block will receive:
+    # `length.defer(xs) { |n| 1 + n }` stands for `1 + length xs` and runs
+    # with the pending work kept off Ruby's stack, however deep it goes.
+    def defer(*args, &continuation)
+      raise ArgumentError, "defer needs a block to receive the result" unless continuation
+
+      TailCall.new(self, args, continuation)
     end
 
     # Build a function from clauses (use {HaskellMatch.fn}).  The native
@@ -112,6 +124,28 @@ module HaskellMatch
 
   class << self
     attr_writer :exhaustive, :overlapping
+
+    # Every this many nested calls the next clause body runs in a fresh Fiber
+    # (with its own VM and machine stacks), so plain recursion is bounded by
+    # memory rather than by Ruby's stack size.  0 disables this.
+    def stack_segment
+      Native.stack_segment
+    end
+
+    def stack_segment=(levels)
+      Native.stack_segment = levels
+    end
+
+    # Deepest allowed nesting of calls (0 = unlimited); beyond it
+    # {StackOverflowError} is raised rather than letting a runaway recursion
+    # take all memory.
+    def max_depth
+      Native.max_depth
+    end
+
+    def max_depth=(levels)
+      Native.max_depth = levels
+    end
 
     # Default policy for non-exhaustive clause sets: :error (Haskell's
     # behaviour, the default), :warn or :ignore.

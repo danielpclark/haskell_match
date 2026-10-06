@@ -13,6 +13,8 @@ class RactorTest < Minitest::Test
     old = Warning[:experimental]
     Warning[:experimental] = false
     yield
+  rescue Ractor::RemoteError => e
+    raise e.cause || e
   ensure
     Warning[:experimental] = old
   end

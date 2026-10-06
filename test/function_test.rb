@@ -367,7 +367,7 @@ class FunctionTest < Minitest::Test
     assert_raises(HaskellMatch::DefinitionError) { fn { } }
     assert_raises(HaskellMatch::DefinitionError) { fn { on { 1 } } }
     assert_raises(HaskellMatch::DefinitionError) { fn { on("x") } }
-    assert_raises(HaskellMatch::DefinitionError) { fn { on(:x) { 1 } } }
+    assert_raises(HaskellMatch::DefinitionError) { fn { on(Object.new) { 1 } } }
     assert_raises(HaskellMatch::DefinitionError) { fn { on("x", guard: 5) { 1 } } }
     err = assert_raises(HaskellMatch::ClauseArityError) { fn(:f) { on("x", "y") { 1 }; on("x") { 2 } } }
     assert_includes err.message, "different numbers of arguments"
@@ -453,33 +453,53 @@ class FunctionTest < Minitest::Test
     :not_reached
   end
 
-  def test_recursion_depth
+  def test_deep_recursion_is_not_bounded_by_the_vm_stack
     count = fn(:count) { on("[]") { 0 }; on("(_:xs)") { |xs| 1 + count.(xs) } }
     assert_equal 2000, count.((1..2000).to_a)
-    # Each level is a dispatch frame plus the body's frame on Ruby's VM
-    # stack, the same shape as Ruby code that reaches the recursive call
-    # through a yielding helper; the depth matches that shape.
-    ruby_count = ->(xs) { xs.empty? ? 0 : 1 + dispatch { ruby_count.(xs[1..]) } }
-    ruby_limit = probe_depth { |n| ruby_count.((1..n).to_a) }
-    ours = probe_depth { |n| count.((1..n).to_a) }
-    assert_operator ours, :>=, ruby_limit * 0.8, "recursion depth #{ours} vs plain Ruby #{ruby_limit}"
-  end
-
-  def dispatch
-    yield
-  end
-
-  def probe_depth
-    n = 500
-    loop do
-      begin
-        yield n
-      rescue SystemStackError
-        return n
-      end
-      n = (n * 1.3).to_i
-      return n if n > 1_000_000
+    # plain Ruby dies here; stack segments carry the recursion through
+    ruby_count = ->(xs) { xs.empty? ? 0 : 1 + ruby_count.(xs[1..]) }
+    assert_raises(SystemStackError) { ruby_count.((1..200_000).to_a) }
+    assert_equal 200_000, count.((1..200_000).to_a)
+    walk = fn(:walk) do
+      on("Leaf") { [] }
+      on("Node l v r") { |l, v, r| walk.(l) + [v] + walk.(r) }
     end
+    deep = (1..50_000).inject(Leaf) { |t, i| Node.new(t, i, Leaf) }
+    assert_equal (1..50_000).to_a, walk.(deep)
+    # exceptions raised deep inside segments propagate with their class
+    boom = Class.new(StandardError)
+    bomb = fn(:bomb) { on("0") { raise boom, "bottom" }; on("n") { |n| bomb.(n - 1) + 1 } }
+    err = assert_raises(boom) { bomb.(30_000) }
+    assert_equal "bottom", err.message
+    assert_equal 2000, count.((1..2000).to_a) # depth accounting is intact afterwards
+  end
+
+  def test_max_depth_guard
+    assert_equal 250_000, HaskellMatch.max_depth
+    forever = fn(:forever) { on("n") { |n| forever.(n + 1) + 1 } }
+    HaskellMatch.max_depth = 5_000
+    err = assert_raises(HaskellMatch::StackOverflowError) { forever.(0) }
+    assert_includes err.message, "max_depth (5000)"
+    count = fn(:count) { on("[]") { 0 }; on("(_:xs)") { |xs| 1 + count.(xs) } }
+    assert_equal 4_000, count.((1..4_000).to_a) # depth accounting is intact
+    assert_raises(ArgumentError) { HaskellMatch.max_depth = -1 }
+    # tail calls do not count as depth
+    loop_fn = fn(:loop_fn) { on("0") { :done }; on("n") { |n| loop_fn.tail(n - 1) } }
+    assert_equal :done, loop_fn.(100_000)
+  ensure
+    HaskellMatch.max_depth = 250_000
+  end
+
+  def test_stack_segment_setting
+    assert_equal 100, HaskellMatch.stack_segment
+    count = fn(:count) { on("[]") { 0 }; on("(_:xs)") { |xs| 1 + count.(xs) } }
+    HaskellMatch.stack_segment = 0
+    assert_raises(SystemStackError) { count.((1..200_000).to_a) }
+    HaskellMatch.stack_segment = 20
+    assert_equal 100_000, count.((1..100_000).to_a)
+    assert_raises(ArgumentError) { HaskellMatch.stack_segment = -1 }
+  ensure
+    HaskellMatch.stack_segment = 100
   end
 
   def test_tail_calls_run_in_constant_stack
@@ -496,9 +516,28 @@ class FunctionTest < Minitest::Test
     assert even.(1_000_000)
     refute odd.(1_000_000)
     # the marker is an ordinary value outside a call
-    assert_equal HaskellMatch::TailCall.new(go, [1, 2]), go.tail(1, 2)
-    assert_raises(TypeError) { fn { on("x") { HaskellMatch::TailCall.new(5, [1]) } }.(1) }
-    assert_raises(ArgumentError) { fn { on("x") { HaskellMatch::TailCall.new(go, 1) } }.(1) }
+    assert_equal HaskellMatch::TailCall.new(go, [1, 2], nil), go.tail(1, 2)
+    assert_raises(TypeError) { fn { on("x") { HaskellMatch::TailCall.new(5, [1], nil) } }.(1) }
+    assert_raises(ArgumentError) { fn { on("x") { HaskellMatch::TailCall.new(go, 1, nil) } }.(1) }
+  end
+
+  def test_deferred_calls_keep_continuations_off_the_ruby_stack
+    length = fn(:length) do
+      on("[]") { 0 }
+      on("(_:xs)") { |xs| length.defer(xs) { |n| 1 + n } }
+    end
+    assert_equal 3, length.([1, 2, 3])
+    HaskellMatch.stack_segment = 0 # no segments: continuations alone carry it
+    assert_equal 300_000, length.((1..300_000).to_a)
+    sum_tree = fn(:sum_tree) do
+      on("Leaf") { 0 }
+      on("Node l v r") { |l, v, r| sum_tree.defer(l) { |ls| sum_tree.defer(r) { |rs| ls + v + rs } } }
+    end
+    deep = (1..100_000).inject(Leaf) { |t, i| Node.new(t, i, Leaf) }
+    assert_equal 100_000 * 100_001 / 2, sum_tree.(deep)
+    assert_raises(ArgumentError) { length.defer([1]) }
+  ensure
+    HaskellMatch.stack_segment = 100
   end
 
   def test_recursion_by_name_and_recur

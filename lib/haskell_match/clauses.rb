@@ -20,6 +20,8 @@ module HaskellMatch
   # callable.  Instance variables of that object are not visible; take the
   # builder as a block parameter (`fn { |m| m.on(...) { @x } }`) when needed.
   class ClauseBuilder
+    include PatternAST::BuilderMethods
+
     attr_reader :clauses
 
     def initialize(owner = nil)
@@ -27,7 +29,8 @@ module HaskellMatch
       @owner = owner
     end
 
-    # Add a clause.  Patterns are Haskell pattern strings, one per argument.
+    # Add a clause: one pattern per argument, each either a Haskell pattern
+    # string or a pattern written in place (see {PatternAST}).
     def on(*patterns, guard: nil, where: nil, &body)
       guard ||= where
       raise DefinitionError, "a clause needs at least one pattern" if patterns.empty?
@@ -36,14 +39,11 @@ module HaskellMatch
         raise DefinitionError, "guard must be callable (a Proc or lambda)"
       end
 
-      patterns.each do |p|
-        raise DefinitionError, "patterns must be Strings, got #{p.inspect}" unless p.is_a?(String)
-      end
-      @clauses << Clause.new(patterns.map(&:dup).each(&:freeze).freeze, guard, body, body.source_location)
+      texts = patterns.map { |p| p.is_a?(String) ? p.dup.freeze : PatternAST.render(p).freeze }
+      @clauses << Clause.new(texts.freeze, guard, body, body.source_location)
       self
     end
     alias clause on
-    alias _ on
 
     # Haskell's `otherwise`: a guard that always passes.
     def otherwise
@@ -71,6 +71,10 @@ module HaskellMatch
       (@owner && @owner.respond_to?(name, include_private)) || super
     end
 
+    def pattern_owner_responds?(name)
+      !@owner.nil? && @owner.respond_to?(name, true)
+    end
+
     # Run a definition block: instance_exec'd on the builder when it takes no
     # parameters, otherwise called with the builder as its argument.  Returns
     # the builder; call {#define_function} once the function exists so clause
@@ -91,9 +95,15 @@ module HaskellMatch
     # and, when the name is a valid method name, as `name`.
     def define_function(function, name)
       @function = function
-      return unless name.is_a?(String) && name.match?(NAME_PATTERN) && !respond_to?(name, true)
+      return unless name.is_a?(String) && name.match?(NAME_PATTERN) && !real_method?(name)
 
       define_singleton_method(name) { function }
+    end
+
+    # A method actually defined on the builder (not one `method_missing`
+    # would synthesise as a pattern variable).
+    def real_method?(name)
+      singleton_class.method_defined?(name) || singleton_class.private_method_defined?(name)
     end
 
     # Clause-builder behaviour for Ractor-shareable functions.  A Module is
@@ -101,6 +111,8 @@ module HaskellMatch
     # modules are always shareable while remaining open for a constant that
     # points back at the finished function.
     module RactorHost
+      include PatternAST::BuilderMethods
+
       def self.new_builder
         host = Module.new
         host.extend(RactorHost)
@@ -120,14 +132,11 @@ module HaskellMatch
           raise DefinitionError, "guard must be callable (a Proc or lambda)"
         end
 
-        patterns.each do |p|
-          raise DefinitionError, "patterns must be Strings, got #{p.inspect}" unless p.is_a?(String)
-        end
-        @clauses << Clause.new(patterns.map(&:dup).each(&:freeze).freeze, guard, body, body.source_location)
+        texts = patterns.map { |p| p.is_a?(String) ? p.dup.freeze : PatternAST.render(p).freeze }
+        @clauses << Clause.new(texts.freeze, guard, body, body.source_location)
         self
       end
       alias clause on
-      alias _ on
 
       def otherwise
         OTHERWISE
@@ -141,7 +150,8 @@ module HaskellMatch
 
       def define_function(function, name)
         const_set(:FUNCTION, function)
-        return unless name.is_a?(String) && name.match?(NAME_PATTERN) && !respond_to?(name, true)
+        return if !name.is_a?(String) || !name.match?(NAME_PATTERN)
+        return if singleton_class.method_defined?(name) || singleton_class.private_method_defined?(name)
 
         host = self
         define_singleton_method(name, &Ractor.make_shareable(-> { host.const_get(:FUNCTION) }))

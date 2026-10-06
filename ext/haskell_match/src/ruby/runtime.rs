@@ -28,10 +28,12 @@ pub enum SlotKind {
     Char,
 }
 
+/// A value slot of the decision tree.  Kept to 16 bytes: slots live on the
+/// native stack of every (possibly deeply recursive) call.
 #[derive(Clone, Copy)]
 pub struct Slot {
     pub v: Value,
-    pub off: i64,
+    pub off: i32,
     pub kind: SlotKind,
 }
 
@@ -56,6 +58,68 @@ extern "C" {
         begin: std::os::raw::c_long,
         len: std::os::raw::c_long,
     ) -> Value;
+}
+
+/// `HaskellMatch::LazyList` (a memoised lazy cons cell) and `Enumerator`,
+/// looked up once.  Values of these classes are matched by list patterns.
+struct LazyClasses {
+    lazy_list: Value,
+    enumerator: Value,
+    force: rutie::types::Id,
+    from: rutie::types::Id,
+}
+
+static LAZY: std::sync::OnceLock<LazyClasses> = std::sync::OnceLock::new();
+
+fn lazy_classes() -> &'static LazyClasses {
+    LAZY.get_or_init(|| {
+        let lazy_list = rutie::Module::from_existing("HaskellMatch").get_nested_class("LazyList");
+        let enumerator = rutie::Class::from_existing("Enumerator");
+        unsafe { rutie::rubysys::gc::rb_gc_register_mark_object(lazy_list.value()) };
+        let force = std::ffi::CString::new("force").unwrap();
+        let from = std::ffi::CString::new("from").unwrap();
+        LazyClasses {
+            lazy_list: lazy_list.value(),
+            enumerator: enumerator.value(),
+            force: unsafe { rutie::rubysys::symbol::rb_intern(force.as_ptr()) },
+            from: unsafe { rutie::rubysys::symbol::rb_intern(from.as_ptr()) },
+        }
+    })
+}
+
+/// Force a lazy cell: `Ok(None)` for the empty list, `Ok(Some((head, tail)))`
+/// for a cons, `Err(state)` when forcing raised.
+unsafe fn force_lazy(cell: Value) -> Result<Option<(Value, Value)>, i32> {
+    let lc = lazy_classes();
+    let r =
+        call_protected(|| rutie::rubysys::vm::rb_funcallv(cell, lc.force, 0, std::ptr::null()))?;
+    if r.is_nil() || r.ty() != ValueType::Array || array::rb_ary_len(r) != 2 {
+        return Ok(None);
+    }
+    Ok(Some((array::rb_ary_entry(r, 0), array::rb_ary_entry(r, 1))))
+}
+
+/// Is `v` a lazy list (a cell, or an Enumerator to be wrapped as one)?
+#[inline]
+unsafe fn is_lazy(v: Value) -> bool {
+    if v.is_fixnum() || v.is_flonum() || v.is_nil() || v.is_true() || v.is_false() || v.is_symbol()
+    {
+        return false;
+    }
+    let lc = lazy_classes();
+    class::rb_obj_is_kind_of(v, lc.lazy_list).is_true()
+        || class::rb_obj_is_kind_of(v, lc.enumerator).is_true()
+}
+
+/// Wrap an Enumerator in a fresh lazy list (cells are memoised, and a new
+/// wrapper iterates from the start, so the same stream matches the same way
+/// on every call).
+unsafe fn as_lazy_cell(v: Value) -> Result<Value, i32> {
+    let lc = lazy_classes();
+    if class::rb_obj_is_kind_of(v, lc.lazy_list).is_true() {
+        return Ok(v);
+    }
+    call_protected(|| rutie::rubysys::vm::rb_funcallv(lc.lazy_list, lc.from, 1, &v))
 }
 
 pub struct RtCase {
@@ -250,9 +314,9 @@ fn truthy(v: Value) -> bool {
 #[inline]
 unsafe fn list_len(slot: Slot) -> Option<i64> {
     if is_array(slot.v) {
-        Some(ary_len(slot.v) - slot.off)
+        Some(ary_len(slot.v) - slot.off as i64)
     } else if is_string(slot.v) && slot.kind != SlotKind::Char {
-        Some(rutie::rubysys::string::rb_str_strlen(slot.v) as i64 - slot.off)
+        Some(rutie::rubysys::string::rb_str_strlen(slot.v) as i64 - slot.off as i64)
     } else {
         None
     }
@@ -261,17 +325,17 @@ unsafe fn list_len(slot: Slot) -> Option<i64> {
 /// Identify the constructor (by tag) of `slot` for type `ty`; `None` when the
 /// value is not of that type at all.
 #[inline]
-unsafe fn identify(env: &TypeEnv, ty: TypeId, slot: Slot) -> Option<usize> {
-    match env.ty(ty).kind {
+unsafe fn identify(env: &TypeEnv, ty: TypeId, slot: Slot) -> Result<Option<usize>, RtError> {
+    Ok(match env.ty(ty).kind {
         TypeKind::Adt => {
             if slot.kind != SlotKind::Plain {
-                return None;
+                return Ok(None);
             }
             let klass = class::rb_obj_class(slot.v).value;
             let dt = env.ty(ty);
             for &c in &dt.cons {
                 if env.con(c).handle == klass {
-                    return Some(env.con(c).tag);
+                    return Ok(Some(env.con(c).tag));
                 }
             }
             None
@@ -287,18 +351,28 @@ unsafe fn identify(env: &TypeEnv, ty: TypeId, slot: Slot) -> Option<usize> {
                 None
             }
         }
-        TypeKind::List => list_len(slot).map(|n| if n == 0 { 0 } else { 1 }),
+        TypeKind::List => match list_len(slot) {
+            Some(n) => Some(if n == 0 { 0 } else { 1 }),
+            None if slot.kind == SlotKind::Plain && is_lazy(slot.v) => {
+                let cell = as_lazy_cell(slot.v).map_err(RtError::Ruby)?;
+                match force_lazy(cell).map_err(RtError::Ruby)? {
+                    None => Some(0),
+                    Some(_) => Some(1),
+                }
+            }
+            None => None,
+        },
         TypeKind::Tuple(n) => {
             if slot.kind != SlotKind::Char
                 && is_array(slot.v)
-                && (ary_len(slot.v) - slot.off) as usize == n
+                && (ary_len(slot.v) - slot.off as i64) as usize == n
             {
                 Some(0)
             } else {
                 None
             }
         }
-    }
+    })
 }
 
 /// Write the fields of the constructor at `slot` into `slots[base..]`.
@@ -310,7 +384,7 @@ unsafe fn fields_into(
     arity: usize,
     base: usize,
     slots: &mut [Slot],
-) {
+) -> Result<(), RtError> {
     match env.ty(ty).kind {
         TypeKind::Adt => {
             for i in 0..arity {
@@ -321,15 +395,23 @@ unsafe fn fields_into(
         TypeKind::Bool => {}
         TypeKind::List => {
             if arity == 2 {
-                slots[base] = if is_array(slot.v) {
-                    Slot::plain(array::rb_ary_entry(slot.v, slot.off as _))
-                } else {
-                    Slot {
+                if is_array(slot.v) {
+                    slots[base] = Slot::plain(array::rb_ary_entry(slot.v, slot.off as _));
+                } else if is_string(slot.v) {
+                    slots[base] = Slot {
                         v: slot.v,
                         off: slot.off,
                         kind: SlotKind::Char,
+                    };
+                } else {
+                    // a lazy cell, already forced by `identify` (memoised)
+                    let cell = as_lazy_cell(slot.v).map_err(RtError::Ruby)?;
+                    if let Some((head, tail)) = force_lazy(cell).map_err(RtError::Ruby)? {
+                        slots[base] = Slot::plain(head);
+                        slots[base + 1] = Slot::plain(tail);
                     }
-                };
+                    return Ok(());
+                }
                 slots[base + 1] = Slot {
                     v: slot.v,
                     off: slot.off + 1,
@@ -339,11 +421,14 @@ unsafe fn fields_into(
         }
         TypeKind::Tuple(_) => {
             for i in 0..arity {
-                slots[base + i] =
-                    Slot::plain(array::rb_ary_entry(slot.v, (slot.off + i as i64) as _));
+                slots[base + i] = Slot::plain(array::rb_ary_entry(
+                    slot.v,
+                    (slot.off as i64 + i as i64) as _,
+                ));
             }
         }
     }
+    Ok(())
 }
 
 /// Turn a slot into the Ruby object a variable bound to it should see.
@@ -355,10 +440,10 @@ unsafe fn materialize(slot: Slot) -> Value {
             if slot.off == 0 {
                 slot.v
             } else if is_array(slot.v) {
-                let len = ary_len(slot.v) - slot.off;
+                let len = ary_len(slot.v) - slot.off as i64;
                 array::rb_ary_subseq(slot.v, slot.off as _, len.max(0) as _)
             } else {
-                let len = rutie::rubysys::string::rb_str_strlen(slot.v) as i64 - slot.off;
+                let len = rutie::rubysys::string::rb_str_strlen(slot.v) as i64 - slot.off as i64;
                 rb_str_substr(slot.v, slot.off as _, len.max(0) as _)
             }
         }
@@ -368,11 +453,11 @@ unsafe fn materialize(slot: Slot) -> Value {
 
 /// The character at `off` of an ASCII-only string, without allocating.
 #[inline]
-unsafe fn ascii_char_at(v: Value, off: i64) -> Option<u8> {
+unsafe fn ascii_char_at(v: Value, off: i32) -> Option<u8> {
     if rutie::rubysys::string::rb_enc_str_asciionly_p(v) == 0 {
         return None;
     }
-    let len = rutie::rubysys::string::rstring_len(v) as i64;
+    let len = rutie::rubysys::string::rstring_len(v) as i32;
     if off < 0 || off >= len {
         return None;
     }
@@ -458,8 +543,13 @@ pub enum Bound {
     Array(Value),
 }
 
-/// Capacity of the stack buffer callers hand to `select`.
-pub const STACK_BINDS: usize = 64;
+/// Capacity of the stack buffer callers hand to `select`.  Wider clauses use
+/// a Ruby array instead; the buffer is small because it lives on the native
+/// stack of every call.
+pub const STACK_BINDS: usize = 16;
+
+/// Slots kept on the native stack; matchers needing more use the heap.
+const STACK_SLOTS: usize = 12;
 
 #[inline]
 fn qnil() -> Value {
@@ -515,9 +605,9 @@ impl Matcher {
                 got: args.len(),
             });
         }
-        let mut stack = [Slot::empty(); 32];
+        let mut stack = [Slot::empty(); STACK_SLOTS];
         let mut heap: Vec<Slot> = Vec::new();
-        let slots: &mut [Slot] = if self.n_slots <= 32 {
+        let slots: &mut [Slot] = if self.n_slots <= STACK_SLOTS {
             &mut stack[..self.n_slots.max(1)]
         } else {
             heap.resize(self.n_slots, Slot::empty());
@@ -565,10 +655,10 @@ impl Matcher {
                     // accept it, as `_` accepts anything in Haskell.  Without
                     // such rows no clause could ever match it: report the
                     // type error Haskell would have found statically.
-                    match identify(&self.env, *ty, s) {
+                    match identify(&self.env, *ty, s)? {
                         Some(tag) => match cases.iter().find(|c| c.tag == tag) {
                             Some(c) => {
-                                fields_into(&self.env, *ty, s, c.arity, c.base, slots);
+                                fields_into(&self.env, *ty, s, c.arity, c.base, slots)?;
                                 node = &c.tree;
                             }
                             None => match default {
@@ -705,9 +795,11 @@ impl Matcher {
                 let con = self.env.con(*c);
                 let ty = con.ty;
                 match identify(&self.env, ty, slot) {
-                    Some(tag) if tag == con.tag => {
+                    Ok(Some(tag)) if tag == con.tag => {
                         let mut tmp = vec![Slot::empty(); con.arity];
-                        fields_into(&self.env, ty, slot, con.arity, 0, &mut tmp);
+                        if fields_into(&self.env, ty, slot, con.arity, 0, &mut tmp).is_err() {
+                            return false;
+                        }
                         args.iter()
                             .zip(tmp.iter())
                             .all(|(a, s)| self.destructure(a, *s, store))

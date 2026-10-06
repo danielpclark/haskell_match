@@ -72,6 +72,78 @@ fn ids() -> &'static Ids {
 extern "C" {
     /// Resume a pending exception or non-local jump captured by `rb_protect`.
     fn rb_jump_tag(state: c_int) -> !;
+    fn rb_fiber_new(func: rutie::rubysys::types::BlockCallFunction, obj: Value) -> Value;
+    fn rb_fiber_resume(fiber: Value, argc: c_int, argv: *const Value) -> Value;
+}
+
+thread_local! {
+    /// Nesting depth of native calls on this thread.
+    static DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Every this many nested native calls, the next clause body runs in a fresh
+/// Fiber.  Each Fiber brings its own VM stack and machine stack, so chained
+/// segments make the recursion depth a matter of memory rather than of
+/// Ruby's fixed stack size.  0 disables segmentation.
+static STACK_SEGMENT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(DEFAULT_STACK_SEGMENT);
+const DEFAULT_STACK_SEGMENT: usize = 100;
+
+/// Maximum nesting depth of native calls before `StackOverflowError` is
+/// raised, so a runaway recursion fails instead of consuming all memory
+/// (GHC has the same kind of limit).  0 means unlimited.
+static MAX_DEPTH: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(DEFAULT_MAX_DEPTH);
+const DEFAULT_MAX_DEPTH: usize = 250_000;
+
+rutie_callback! {
+    /// Body of a stack-segment Fiber: `data` is `[body, values]`.
+    fn segment_fiber_body(
+        _yielded: Value,
+        data: Value,
+        _argc: c_int,
+        _argv: *const Value,
+        _block: Value,
+    ) -> Value {
+        unsafe {
+            let body = array::rb_ary_entry(data, 0);
+            let vals = array::rb_ary_entry(data, 1);
+            rutie::rubysys::rproc::rb_proc_call(body, vals)
+        }
+    }
+}
+
+/// Invoke a clause body, either directly or (every `STACK_SEGMENT` levels)
+/// in a fresh Fiber.  Exceptions and non-local jumps are returned as the
+/// `rb_protect` state for the caller to resume once it has cleaned up.
+unsafe fn invoke_body(body: Value, bound: &Bound, buf: &[Value]) -> Result<Value, i32> {
+    let segment = STACK_SEGMENT.load(std::sync::atomic::Ordering::Relaxed);
+    let depth = DEPTH.with(|d| d.get());
+    let max = MAX_DEPTH.load(std::sync::atomic::Ordering::Relaxed);
+    if max > 0 && depth >= max {
+        VM::raise_ex(exception(
+            "StackOverflowError",
+            &format!(
+                "recursion deeper than HaskellMatch.max_depth ({}); use tail calls, defer, or raise the limit",
+                max
+            ),
+        ));
+    }
+    DEPTH.with(|d| d.set(depth + 1));
+    let result = if segment > 0 && (depth + 1).is_multiple_of(segment) {
+        let vals = runtime::bound_to_array(bound, buf);
+        let pair = [body, vals];
+        let data = array::rb_ary_new_from_values(2, pair.as_ptr());
+        let fiber = rb_fiber_new(
+            segment_fiber_body as rutie::rubysys::types::BlockCallFunction,
+            data,
+        );
+        runtime::call_protected(|| rb_fiber_resume(fiber, 0, std::ptr::null()))
+    } else {
+        runtime::call_protected(|| runtime::invoke(body, bound, buf))
+    };
+    DEPTH.with(|d| d.set(depth));
+    result
 }
 
 /// Typed-data definition for `Matcher`.  Unlike Rutie's `wrappable_struct!`
@@ -340,6 +412,32 @@ methods!(
             Err(e) => raise_core(e),
         }
     },
+    // stack_segment -> Integer (0 = disabled)
+    fn native_stack_segment() -> Integer {
+        Integer::new(STACK_SEGMENT.load(std::sync::atomic::Ordering::Relaxed) as i64)
+    },
+    // stack_segment = n
+    fn native_set_stack_segment(n: Integer) -> Integer {
+        let n = n.map(|i| i.to_i64()).unwrap_or(-1);
+        if n < 0 {
+            raise_arg("stack_segment must be a non-negative Integer (0 disables segmentation)");
+        }
+        STACK_SEGMENT.store(n as usize, std::sync::atomic::Ordering::Relaxed);
+        Integer::new(n)
+    },
+    // max_depth -> Integer (0 = unlimited)
+    fn native_max_depth() -> Integer {
+        Integer::new(MAX_DEPTH.load(std::sync::atomic::Ordering::Relaxed) as i64)
+    },
+    // max_depth = n
+    fn native_set_max_depth(n: Integer) -> Integer {
+        let n = n.map(|i| i.to_i64()).unwrap_or(-1);
+        if n < 0 {
+            raise_arg("max_depth must be a non-negative Integer (0 means unlimited)");
+        }
+        MAX_DEPTH.store(n as usize, std::sync::atomic::Ordering::Relaxed);
+        Integer::new(n)
+    },
     // constructors(type_name) -> [names] or nil
     fn native_constructors(name: RString) -> AnyObject {
         let name = name
@@ -599,18 +697,28 @@ fn check_guards(guards: Value) -> Result<(), String> {
 /// matcher.call(*args): select a clause and call its body (from `@bodies`,
 /// with guards from `@guards`).
 ///
-/// A body may return a `HaskellMatch::TailCall` (see `Function#tail`): the
-/// call then continues with that marker's function and arguments without
-/// growing either stack, so tail-recursive loops run in constant space as
-/// they do in Haskell.
+/// The call runs as a trampoline.  A body may return a
+/// `HaskellMatch::TailCall(function, args, continuation)`:
+///
+/// * with a nil continuation (`Function#tail`) the call simply continues
+///   with that function and those arguments, in constant stack space;
+/// * with a continuation (`Function#defer`) the continuation is pushed on a
+///   Ruby array owned by this frame and the call continues; once a body
+///   returns an ordinary value the pending continuations are applied to it
+///   one after another (each may itself return a `TailCall`).
+///
+/// Recursion depth is therefore bounded by memory, as in GHC, rather than
+/// by Ruby's VM stack.
 unsafe extern "C" fn matcher_call(argc: c_int, argv: *const Value, rtself: Value) -> Value {
     let mut buf = [Value::from(0); STACK_BINDS];
     let mut target = rtself;
-    // The marker object (if any) keeps the next arguments alive while they
-    // are matched; it is held in this frame so the GC's stack scan sees it.
+    // Pending continuations (a Ruby array, rooted by this frame).
+    let mut conts = Value::from(rutie::rubysys::value::RubySpecialConsts::Nil as usize);
+    // The current marker keeps the next arguments alive while they are matched.
     let mut marker = Value::from(0);
     let mut args_vec: Vec<Value> = Vec::new();
     let mut first = true;
+    let tail_class = tail_call_class();
     loop {
         let args: &[Value] = if first {
             std::slice::from_raw_parts(argv, argc.max(0) as usize)
@@ -638,21 +746,41 @@ unsafe extern "C" fn matcher_call(argc: c_int, argv: *const Value, rtself: Value
             drop(args_vec);
             raise_arg("this matcher has no clause bodies attached");
         }
-        // Nothing needing Drop must be live across the body call, which may
-        // longjmp: `args_vec` is emptied first (its arguments are rooted by
-        // `marker` anyway).
+        // Nothing needing Drop may be live across a call into Ruby, which
+        // may longjmp: `args_vec` is emptied first (its arguments are rooted
+        // by `marker` anyway).
         drop(std::mem::take(&mut args_vec));
-        let result = runtime::invoke(p.body, &p.bound, &buf);
-        if rclass::rb_obj_class(result).value != tail_call_class() {
-            std::hint::black_box(marker);
-            return result;
+        let mut result = match invoke_body(p.body, &p.bound, &buf) {
+            Ok(v) => v,
+            Err(state) => rb_jump_tag(state),
+        };
+        // Apply pending continuations until one asks for another call.
+        while rclass::rb_obj_class(result).value != tail_class {
+            if conts.is_nil() || array::rb_ary_len(conts) == 0 {
+                std::hint::black_box(marker);
+                return result;
+            }
+            let k = array::rb_ary_pop(conts);
+            result = rutie::rubysys::rproc::rb_proc_call_with_block(
+                k,
+                1,
+                &result,
+                Value::from(rutie::rubysys::value::RubySpecialConsts::Nil as usize),
+            );
         }
-        // TailCall(function, args): continue with the next iteration.
+        // TailCall(function, args, continuation): continue with the next call.
         marker = result;
         let function = rstruct::rb_struct_aref(result, Integer::new(0).value());
         let next_args = rstruct::rb_struct_aref(result, Integer::new(1).value());
+        let continuation = rstruct::rb_struct_aref(result, Integer::new(2).value());
         if next_args.ty() != ValueType::Array {
             raise_arg("TailCall arguments must be an Array");
+        }
+        if !continuation.is_nil() {
+            if conts.is_nil() {
+                conts = array::rb_ary_new();
+            }
+            array::rb_ary_push(conts, continuation);
         }
         // The matcher type is checked by `matcher_of` on the next iteration.
         target = function;
@@ -809,6 +937,10 @@ pub fn init() {
         m.def_self("register_type", native_register_type);
         m.def_self("render_pattern", native_render_pattern);
         m.def_self("constructors", native_constructors);
+        m.def_self("stack_segment", native_stack_segment);
+        m.def_self("stack_segment=", native_set_stack_segment);
+        m.def_self("max_depth", native_max_depth);
+        m.def_self("max_depth=", native_set_max_depth);
     });
     let object = Class::from_existing("Object");
     let mut matcher = native.define_nested_class("Matcher", Some(&object));
