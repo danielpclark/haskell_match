@@ -256,6 +256,44 @@ class HaskellTest < Minitest::Test
     assert_equal 42, m.answer
   end
 
+  def test_deriving_in_haskell_declarations
+    m = hs(<<~HS)
+      data Color = Red | Green | Blue deriving (Eq, Ord, Enum, Bounded, Show)
+
+      next :: Color -> Color
+      next Blue = Red
+      next c = succ c
+
+      warmer :: Color -> Color -> Bool
+      warmer a b = a < b
+
+      all :: [Color]
+      all = [Red ..]
+
+      odds :: [Color]
+      odds = [Red, Blue ..]
+
+      span' :: Color -> Color -> [Color]
+      span' a b = [a .. b]
+
+      idx :: Color -> Int
+      idx = fromEnum
+
+      letters :: String
+      letters = ['a' .. 'e']
+    HS
+    assert_equal [m::Green, m::Red], [m.next(m::Red), m.next(m::Blue)]
+    assert_equal true, m.warmer(m::Red, m::Blue)
+    assert_equal [m::Red, m::Green, m::Blue], m.all
+    assert_equal [m::Red, m::Blue], m.odds
+    assert_equal [m::Green, m::Blue], m.span_prime(m::Green, m::Blue)
+    assert_equal [], m.span_prime(m::Blue, m::Green)
+    assert_equal 2, m.idx(m::Blue)
+    assert_equal "abcde", m.letters
+    assert_equal [m::Red, m::Blue], [m::Color.min_bound, m::Color.max_bound]
+    assert_raises(HaskellMatch::DataDeclarationError) { hs("data T = A Int deriving Enum") }
+  end
+
   # ------------------------------------------------------------ laziness
 
   def test_lists_built_through_cons_are_lazy_like_haskells

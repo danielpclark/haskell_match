@@ -134,6 +134,10 @@ module HaskellMatch
 
       # [from..], [from..to], [from, then ..], [from, then .. to]
       def range(from, step_to = nil, to = nil)
+        # `[Red ..]`, `['a'..'z']`: enumerations and characters go by index
+        return enum_range(from, step_to, to) if from.respond_to?(:from_enum) && from.respond_to?(:data_type)
+        return char_range(from, step_to, to) if from.is_a?(String)
+
         step = step_to.nil? ? 1 : step_to - from
         if to.nil?
           return LazyList.from(Enumerator.produce(from) { |x| x + step })
@@ -156,6 +160,28 @@ module HaskellMatch
           raise HaskellError, "enumFromThenTo: zero step"
         end
         out
+      end
+
+      # Ranges over a `deriving Enum` type, as `enumFrom`, `enumFromThen`,
+      # `enumFromTo` and `enumFromThenTo` would produce.
+      def enum_range(from, step_to, to)
+        type = from.data_type
+        if to.nil?
+          step_to.nil? ? type.enum_from(from) : type.enum_from_then(from, step_to)
+        else
+          step_to.nil? ? type.enum_from_to(from, to) : type.enum_from_then_to(from, step_to, to)
+        end
+      end
+
+      # Ranges over characters: `['a'..'z']`, `['a', 'c'..]`.
+      def char_range(from, step_to, to)
+        step = step_to.nil? ? 1 : step_to.ord - from.ord
+        if to.nil?
+          return LazyList.from(Enumerator.produce(from.ord) { |c| c + step }.lazy.map(&:chr))
+        end
+
+        out = range(from.ord, step_to&.ord, to.ord)
+        out.map(&:chr).join
       end
 
       def op(name)
@@ -222,8 +248,9 @@ module HaskellMatch
     defn(:negate, 1) { |n| -n }
     defn(:abs, 1) { |n| n.abs }
     defn(:signum, 1) { |n| n <=> 0 }
-    defn(:succ, 1) { |x| x.is_a?(String) ? (x.ord + 1).chr : x + 1 }
-    defn(:pred, 1) { |x| x.is_a?(String) ? (x.ord - 1).chr : x - 1 }
+    defn(:succ, 1) { |x| x.is_a?(String) ? (x.ord + 1).chr : x.is_a?(Numeric) ? x + 1 : x.succ }
+    defn(:pred, 1) { |x| x.is_a?(String) ? (x.ord - 1).chr : x.is_a?(Numeric) ? x - 1 : x.pred }
+    defn(:fromEnum, 1) { |x| x.is_a?(String) ? x.ord : x.is_a?(Integer) ? x : x.from_enum }
     defn(:min, 2) { |a, b| a <= b ? a : b }
     defn(:max, 2) { |a, b| a >= b ? a : b }
     defn(:subtract, 2) { |a, b| b - a }

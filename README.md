@@ -1024,8 +1024,10 @@ The front end is a Haskell 2010 parser with the layout rule, so ordinary
 Haskell formatting works. Supported:
 
 * `data` declarations, positional or with record fields, with `deriving`
-  (accepted; `Eq` and `Show` behaviour comes for free from the Ruby values);
-  `type` signatures (accepted and ignored: Ruby is the type system here);
+  (`Eq` and `Show` always hold; `Ord`, `Enum` and `Bounded` work as
+  described under [deriving](#deriving-ord-enum-bounded), so `succ c`,
+  `[Red ..]`, `minBound`-style code runs); `type` signatures (accepted and
+  ignored: Ruby is the type system here);
   `module ... where` headers and `import`s (accepted and ignored: the
   Prelude is always in scope).
 * Function equations with any patterns this library supports (constructors,
