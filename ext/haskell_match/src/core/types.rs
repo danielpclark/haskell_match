@@ -156,13 +156,13 @@ impl TypeEnv {
                 .name
                 .chars()
                 .next()
-                .map(|ch| ch.is_uppercase())
+                .map(|ch| ch.is_uppercase() || ch == ':')
                 .unwrap_or(false)
             {
                 return Err(CoreError::new(
                     ErrorKind::DataDeclaration,
                     format!(
-                        "constructor name '{}' must start with an upper-case letter",
+                        "constructor name '{}' must start with an upper-case letter (or ':' for an infix constructor)",
                         c.name
                     ),
                 ));
@@ -275,6 +275,47 @@ impl TypeEnv {
 
     pub fn types_len(&self) -> usize {
         self.types.len()
+    }
+
+    /// Live user-declared types (not Bool, lists or tuples) with their
+    /// constructor specs, for importing into another type scope.
+    pub fn user_types(&self) -> Vec<(String, Vec<ConSpec>)> {
+        self.types
+            .iter()
+            .filter(|t| t.live && t.kind == TypeKind::Adt)
+            .map(|t| {
+                let cons = t
+                    .cons
+                    .iter()
+                    .map(|&c| {
+                        let c = &self.cons[c];
+                        ConSpec {
+                            name: c.name.clone(),
+                            arity: c.arity,
+                            fields: c.fields.clone(),
+                            handle: c.handle,
+                        }
+                    })
+                    .collect();
+                (t.name.clone(), cons)
+            })
+            .collect()
+    }
+
+    /// Whether `name` is a live type whose constructors are exactly `cons`
+    /// (same names and host handles).
+    pub fn has_same_type(&self, name: &str, cons: &[ConSpec]) -> bool {
+        match self.lookup_type(name) {
+            Some(t) => {
+                let mine = &self.types[t].cons;
+                mine.len() == cons.len()
+                    && mine.iter().zip(cons.iter()).all(|(&m, c)| {
+                        let m = &self.cons[m];
+                        m.name == c.name && m.handle == c.handle
+                    })
+            }
+            None => false,
+        }
     }
 }
 

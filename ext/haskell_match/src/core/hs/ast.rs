@@ -38,6 +38,12 @@ pub enum Expr {
     SectionR(String, Box<Expr>),
     /// `(op)`
     OpFun(String),
+    /// MultiWayIf: `if | quals -> e | quals -> e`
+    MultiIf(Vec<(Vec<Qual>, Expr)>),
+    /// Record construction `Con { f = e, ... }`
+    RecCon(String, Vec<(String, Expr)>),
+    /// Record update `e { f = e, ... }`
+    RecUpdate(Box<Expr>, Vec<(String, Expr)>),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -47,10 +53,12 @@ pub enum Qual {
     Let(Vec<Decl>),
 }
 
+/// A guarded right-hand side: each alternative is a list of qualifiers (a
+/// boolean guard, a pattern guard `p <- e`, or `let` bindings) and a body.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Rhs {
     Plain(Expr),
-    Guarded(Vec<(Expr, Expr)>),
+    Guarded(Vec<(Vec<Qual>, Expr)>),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -89,11 +97,24 @@ pub enum Decl {
         wheres: Vec<Decl>,
         line: usize,
     },
+    /// `import [qualified] M [as A] [hiding] [(items)]`
+    Import {
+        module: String,
+        qualified: bool,
+        alias: Option<String>,
+        hiding: bool,
+        /// Named items (functions, operators, types); `None` imports everything.
+        items: Option<Vec<String>>,
+        line: usize,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Module {
     pub name: Option<String>,
+    /// Names in the export list (functions, operators, types); `None` when
+    /// there is no list, meaning everything is exported.
+    pub exports: Option<Vec<String>>,
     pub decls: Vec<Decl>,
 }
 
@@ -150,6 +171,27 @@ fn render(p: &RawPat, atomic: bool) -> String {
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
+        RawPat::Con(name, args) if name.starts_with(':') => {
+            if args.len() == 2 {
+                format!(
+                    "({} {} {})",
+                    render(&args[0], true),
+                    name,
+                    render(&args[1], true)
+                )
+            } else if args.is_empty() {
+                format!("({})", name)
+            } else {
+                format!(
+                    "(({}) {})",
+                    name,
+                    args.iter()
+                        .map(|a| render(a, true))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                )
+            }
+        }
         RawPat::Con(name, args) => {
             if args.is_empty() {
                 name.clone()

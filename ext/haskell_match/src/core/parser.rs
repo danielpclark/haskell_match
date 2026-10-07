@@ -79,6 +79,7 @@ fn describe(t: &Tok) -> String {
         Tok::RBrace => "'}'".into(),
         Tok::Comma => "','".into(),
         Tok::Colon => "':'".into(),
+        Tok::ConSym(s) => format!("'{}'", s),
         Tok::DoubleColon => "'::'".into(),
         Tok::Equals => "'='".into(),
         Tok::At => "'@'".into(),
@@ -126,6 +127,15 @@ fn pattern(p: &mut P) -> Result<RawPat> {
         let tail = pattern(p)?;
         return Ok(RawPat::Cons(Box::new(head), Box::new(tail)));
     }
+    // infix constructor: `l :+: r` (chains associate to the right)
+    if let Some(Tok::ConSym(op)) = p.peek().cloned() {
+        p.next();
+        if p.peek().is_none() {
+            return Err(p.err(format!("expected a pattern after '{}'", op)));
+        }
+        let rhs = pattern(p)?;
+        return Ok(RawPat::Con(op, vec![head, rhs]));
+    }
     Ok(head)
 }
 
@@ -156,6 +166,23 @@ fn lpat(p: &mut P) -> Result<RawPat> {
                 Some(Tok::ConId(n)) => n,
                 _ => unreachable!(),
             };
+            let mut args = Vec::new();
+            while starts_apat(p.peek()) {
+                args.push(apat(p)?);
+            }
+            Ok(RawPat::Con(name, args))
+        }
+        // prefix use of an infix constructor: `(:+:) a b`
+        Some(Tok::LParen)
+            if matches!(p.peek_at(1), Some(Tok::ConSym(_)))
+                && p.peek_at(2) == Some(&Tok::RParen) =>
+        {
+            p.next();
+            let name = match p.next() {
+                Some(Tok::ConSym(n)) => n,
+                _ => unreachable!(),
+            };
+            p.next();
             let mut args = Vec::new();
             while starts_apat(p.peek()) {
                 args.push(apat(p)?);
@@ -539,8 +566,56 @@ pub fn parse_data(src: &str) -> Result<DataDecl> {
 }
 
 fn con_decl(p: &mut P) -> Result<ConDecl> {
+    // infix constructor: `atype :op: atype`, e.g. `Double :+: Double`
+    let infix = match p.peek() {
+        Some(Tok::ConId(_)) => matches!(p.peek_at(1), Some(Tok::ConSym(_))),
+        Some(Tok::LParen) if matches!(p.peek_at(1), Some(Tok::ConSym(_))) => false,
+        Some(t) if starts_atype(Some(t)) => true,
+        _ => false,
+    };
+    if infix {
+        let from = p.i;
+        atype(p)?;
+        let left = span_text(p, from);
+        let name = match p.next() {
+            Some(Tok::ConSym(op)) => op,
+            Some(t) => {
+                return Err(derr(
+                    p,
+                    format!("expected an infix constructor but found {}", describe(&t)),
+                ))
+            }
+            None => return Err(derr(p, "expected an infix constructor".into())),
+        };
+        let from = p.i;
+        atype(p)?;
+        let right = span_text(p, from);
+        return Ok(ConDecl {
+            name,
+            arity: 2,
+            fields: None,
+            types: vec![left, right],
+        });
+    }
     let name = match p.next() {
         Some(Tok::ConId(n)) => n,
+        // `(:+:) a b`: an infix constructor declared in prefix form
+        Some(Tok::LParen) => {
+            let op = match p.next() {
+                Some(Tok::ConSym(op)) => op,
+                Some(t) => {
+                    return Err(derr(
+                        p,
+                        format!("expected a constructor operator but found {}", describe(&t)),
+                    ))
+                }
+                None => return Err(derr(p, "expected a constructor operator".into())),
+            };
+            match p.next() {
+                Some(Tok::RParen) => op,
+                _ => return Err(derr(p, "expected ')' after constructor operator".into())),
+            }
+        }
         Some(t) => {
             return Err(derr(
                 p,
@@ -926,6 +1001,31 @@ mod tests {
             parse_pattern("P { a = 1, a = 2 }").unwrap_err().kind,
             ErrorKind::Field
         );
+    }
+
+    #[test]
+    fn infix_constructor_patterns_and_decls() {
+        assert_eq!(
+            parse_pattern("a :+: b").unwrap(),
+            con(":+:", vec![v("a"), v("b")])
+        );
+        assert_eq!(
+            parse_pattern("(:+:) a b").unwrap(),
+            con(":+:", vec![v("a"), v("b")])
+        );
+        assert_eq!(
+            parse_pattern("Just (x :| xs)").unwrap(),
+            con("Just", vec![con(":|", vec![v("x"), v("xs")])])
+        );
+        let d = parse_data("C = Double :+: Double | (:*:) Int Int | Plain").unwrap();
+        assert_eq!(d.cons[0].name, ":+:");
+        assert_eq!(
+            d.cons[0].types,
+            vec!["Double".to_string(), "Double".to_string()]
+        );
+        assert_eq!(d.cons[1].name, ":*:");
+        assert_eq!(d.cons[1].arity, 2);
+        assert_eq!(d.cons[2].arity, 0);
     }
 
     #[test]

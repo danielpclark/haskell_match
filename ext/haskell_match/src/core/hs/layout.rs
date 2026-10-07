@@ -6,8 +6,9 @@ use super::lexer::{Tok, Token};
 
 enum Ctx {
     Explicit,
-    /// column of the block, and whether `let` opened it (so `in` may close it)
-    Implicit(usize, bool),
+    /// column of the block, whether `let` opened it (so `in` may close it),
+    /// and whether the current item of a let block has already seen its `=`
+    Implicit(usize, bool, bool),
 }
 
 fn opens_block(t: &Tok) -> bool {
@@ -28,7 +29,7 @@ pub fn layout(tokens: Vec<Token>) -> Vec<Token> {
     ) {
         if let Some(first) = tokens.first() {
             if first.tok != Tok::Eof {
-                ctx.push(Ctx::Implicit(first.col, false));
+                ctx.push(Ctx::Implicit(first.col, false, false));
                 out.push(Token {
                     tok: Tok::VLBrace,
                     line: first.line,
@@ -66,14 +67,14 @@ pub fn layout(tokens: Vec<Token>) -> Vec<Token> {
             }
             // open an implicit block at this token's column
             let enclosing = ctx.iter().rev().find_map(|c| {
-                if let Ctx::Implicit(m, _) = c {
+                if let Ctx::Implicit(m, _, _) = c {
                     Some(*m)
                 } else {
                     None
                 }
             });
             if enclosing.map(|m| t.col > m).unwrap_or(true) {
-                ctx.push(Ctx::Implicit(t.col, is_let));
+                ctx.push(Ctx::Implicit(t.col, is_let, false));
                 out.push(Token {
                     tok: Tok::VLBrace,
                     line: t.line,
@@ -102,7 +103,7 @@ pub fn layout(tokens: Vec<Token>) -> Vec<Token> {
         if t.line > last_line {
             loop {
                 match ctx.last() {
-                    Some(Ctx::Implicit(m, _)) if t.col < *m => {
+                    Some(Ctx::Implicit(m, _, _)) if t.col < *m => {
                         ctx.pop();
                         out.push(Token {
                             tok: Tok::VRBrace,
@@ -110,7 +111,7 @@ pub fn layout(tokens: Vec<Token>) -> Vec<Token> {
                             col: t.col,
                         });
                     }
-                    Some(Ctx::Implicit(m, _)) if t.col == *m => {
+                    Some(Ctx::Implicit(m, _, _)) if t.col == *m => {
                         // a new item in the block, unless the token continues an expression
                         if !matches!(t.tok, Tok::Then | Tok::Else | Tok::Of | Tok::In) {
                             out.push(Token {
@@ -118,6 +119,9 @@ pub fn layout(tokens: Vec<Token>) -> Vec<Token> {
                                 line: t.line,
                                 col: t.col,
                             });
+                            if let Some(Ctx::Implicit(_, _, eq)) = ctx.last_mut() {
+                                *eq = false;
+                            }
                         }
                         break;
                     }
@@ -126,7 +130,13 @@ pub fn layout(tokens: Vec<Token>) -> Vec<Token> {
             }
             last_line = t.line;
         }
+        // `\case` (LambdaCase) opens an alternatives block like `of`
+        let lambda_case =
+            t.tok == Tok::Case && out.last().map(|x| x.tok == Tok::Backslash).unwrap_or(false);
         emit(&mut out, &mut ctx, &mut bracket_stack, t, &mut pending_open);
+        if lambda_case {
+            pending_open = Some(false);
+        }
         i += 1;
     }
     out
@@ -140,10 +150,36 @@ fn emit(
     pending_open: &mut Option<bool>,
 ) {
     match &t.tok {
+        Tok::Equals => {
+            // Inside a `let` block each binding has one `=`; a second one
+            // before the next binding means the block was a guard qualifier
+            // (`| let y = f x = y`) and the block ends here (the report's
+            // parse-error(t) rule, for this one case).
+            let inside_block = brackets.last().map(|d| ctx.len() > *d).unwrap_or(true);
+            if let Some(Ctx::Implicit(_, true, eq_seen)) = ctx.last_mut() {
+                if *eq_seen && inside_block {
+                    ctx.pop();
+                    out.push(Token {
+                        tok: Tok::VRBrace,
+                        line: t.line,
+                        col: t.col,
+                    });
+                } else {
+                    *eq_seen = true;
+                }
+            }
+            out.push(t.clone());
+        }
+        Tok::Semi => {
+            if let Some(Ctx::Implicit(_, _, eq)) = ctx.last_mut() {
+                *eq = false;
+            }
+            out.push(t.clone());
+        }
         Tok::In => {
             // `let ... in`: close the implicit let block if it is still open
             // (the indentation rule may already have closed it)
-            if let Some(Ctx::Implicit(_, true)) = ctx.last() {
+            if let Some(Ctx::Implicit(_, true, _)) = ctx.last() {
                 if brackets.last().map(|d| ctx.len() > *d).unwrap_or(true) {
                     ctx.pop();
                     out.push(Token {
@@ -185,6 +221,14 @@ fn emit(
                         });
                     }
                 }
+            } else if let Some(Ctx::Implicit(_, true, _)) = ctx.last() {
+                // `| let y = e, cond`: a comma ends a let block used as a guard
+                ctx.pop();
+                out.push(Token {
+                    tok: Tok::VRBrace,
+                    line: t.line,
+                    col: t.col,
+                });
             }
             out.push(t.clone());
         }
@@ -283,6 +327,14 @@ mod tests {
         assert_eq!(
             show(src),
             "{ f x = let { y = x ; z = y } in y + z ; g = 1 }"
+        );
+    }
+
+    #[test]
+    fn let_guards_close_at_comma_or_second_equals() {
+        assert_eq!(
+            show("f x\n  | let y = x, y > 1 = y\n  | let z = x = z\n"),
+            "{ f x | let { y = x } Comma y > 1 = y | let { z = x } = z }"
         );
     }
 

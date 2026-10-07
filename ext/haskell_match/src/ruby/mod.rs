@@ -363,6 +363,45 @@ methods!(
         scopes.push(seed);
         Integer::new((scopes.len() - 1) as i64)
     },
+    // import_scope_in(dst, src, names_or_nil) -> [type names imported]
+    fn native_import_scope(dst: Integer, src: Integer, names: AnyObject) -> AnyObject {
+        let dst = scope_arg(dst);
+        let src = scope_arg(src);
+        let names = names.unwrap_or_else(|_| raise_arg("names must be an Array or nil"));
+        let wanted: Option<Vec<String>> = if names.is_nil() {
+            None
+        } else {
+            let arr = array_arg(&names, "type names").unwrap_or_else(|m| raise_arg(&m));
+            Some(
+                arr.into_iter()
+                    .map(|n| str_arg(&n, "type name").unwrap_or_else(|m| raise_arg(&m)))
+                    .collect(),
+            )
+        };
+        let mut scopes = SCOPES.lock().unwrap_or_else(|p| p.into_inner());
+        if src >= scopes.len() || dst >= scopes.len() {
+            raise_arg("unknown type scope");
+        }
+        let types = scopes[src].user_types();
+        let env = &mut scopes[dst];
+        let mut imported = Vec::new();
+        for (name, cons) in types {
+            if let Some(w) = &wanted {
+                if !w.contains(&name) {
+                    continue;
+                }
+            }
+            if env.has_same_type(&name, &cons) {
+                imported.push(name);
+                continue;
+            }
+            match env.register(&name, &cons) {
+                Ok(_) => imported.push(name),
+                Err(e) => raise_core(e),
+            }
+        }
+        rstrings(&imported).to_any_object()
+    },
     // register_type(name, [[con_name, arity, fields_or_nil, klass], ...], scope) -> nil
     fn native_register_type(name: RString, specs: Array, scope: Integer) -> NilClass {
         let name = name
@@ -1121,6 +1160,7 @@ pub fn init() {
     native.define(|m| {
         m.def_self("parse_data", native_parse_data);
         m.def_self("new_scope", native_new_scope);
+        m.def_self("import_scope_in", native_import_scope);
         m.def_self("register_type_in", native_register_type);
         m.def_self("render_pattern_in", native_render_pattern);
         m.def_self("constructors_in", native_constructors);

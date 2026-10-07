@@ -1023,23 +1023,39 @@ Haskell contains backslashes (lambdas) so Ruby leaves them alone.
 The front end is a Haskell 2010 parser with the layout rule, so ordinary
 Haskell formatting works. Supported:
 
-* `data` declarations, positional or with record fields, with `deriving`
-  (`Eq` and `Show` always hold; `Ord`, `Enum` and `Bounded` work as
-  described under [deriving](#deriving-ord-enum-bounded), so `succ c`,
-  `[Red ..]`, `minBound`-style code runs); `type` signatures (accepted and
-  ignored: Ruby is the type system here);
-  `module ... where` headers and `import`s (accepted and ignored: the
-  Prelude is always in scope).
+* `data` and `newtype` declarations, positional, infix (`data V = Double
+  :| Double`) or with record fields (whose names are selector functions,
+  with `P { f = e }` construction and `p { f = e }` update), with
+  `deriving` (`Eq` and `Show` always hold; `Ord`, `Enum` and `Bounded` work
+  as described under [deriving](#deriving-ord-enum-bounded), so `succ c`,
+  `[Red ..]`, `minBound`-style code runs); `type` synonyms and signatures
+  (accepted and ignored: Ruby is the type system here).
+* `module M (exports) where` headers and `import` declarations: see
+  [Modules](#modules-imports-and-exports) below.
+* User-defined operators with `infixl`/`infixr`/`infix` fixity
+  declarations, in prefix form (`(<+>) a b = ...`), infix form
+  (`a <+> b = ...`) or with backticks (``x `cons` xs = ...``), at top level
+  or in `where`/`let`; operators and backticked functions in sections, as
+  values (`(<+>)`) and from Ruby (`Mod.send(:"<+>", a, b)`,
+  `Mod.haskell_function("<+>")`).
 * Function equations with any patterns this library supports (constructors,
-  literals, negative literals, characters, strings, lists, tuples, `_`,
-  as-patterns, lazy and bang patterns, records), guards with `otherwise`,
-  `where` bindings (functions, values and pattern bindings, nested
-  arbitrarily), `let ... in`, `case ... of` with guards, `if/then/else`.
+  infix constructors, literals, negative literals, characters, strings,
+  lists, tuples, `_`, as-patterns, lazy and bang patterns, records), guards
+  with `otherwise`, pattern guards (`| Just v <- lookup k m, v > 0 = ...`)
+  and `let` guards, `where` bindings (functions, values and pattern
+  bindings, nested arbitrarily), `let ... in`, `case ... of` with guards,
+  `if/then/else`.
 * Expressions: application and partial application, operators with the
   Prelude's fixities, backtick operators, sections (`(*2)`, `` (`div` 2) ``,
   `subtract 1`), operator values (`(+)`), `$`, `.`, lambdas (including
   pattern lambdas), tuples, list literals, ranges (`[1..n]`, `[1,3..]`,
   `[0..]`), list comprehensions with generators, guards and `let`.
+* The small syntax extensions GHC users reach for without thinking:
+  `MultiWayIf` (`if | c1 -> e1 | c2 -> e2`), `LambdaCase` (`\case`),
+  `TupleSections` (`(,x)`, `(1,,3)`), `NamedFieldPuns` in construction.
+* Literals: decimal, hexadecimal, octal and binary integers, exponent
+  floats, `_` digit separators, and every Haskell character escape
+  (`\n`, `\x41`, `\o101`, `\65`, `\SOH`, `\^A`, `\&`, string gaps).
 * Names: `camelCase` functions get a `snake_case` alias; a trailing prime
   becomes `_prime` (`foldl'` is callable as `foldl_prime`).
 * Top-level values (`primes = ...`) become memoised methods; a value of
@@ -1047,8 +1063,36 @@ Haskell formatting works. Supported:
   (`Mod.from_list([1, 2])` when `fromList = foldr insert Leaf`).
 
 Out of scope, by design: type classes (`class`/`instance`), `do` notation
-and monads, operator definitions, and anything needing type inference.
-They are rejected with a clear message.
+and monads, and anything needing type inference. They are rejected with a
+clear message.
+
+### Modules, imports and exports
+
+A compiled module can import another. Functions and values of the imported
+module become callable (the compiler uses them with their real arity, tail
+calls included), its data types join the importing module's type scope so
+their constructors work in patterns with full exhaustiveness checking, and
+the constructors become constants of the importing module.
+
+```haskell
+module Physics where
+import Vectors                         -- Vectors.hs on $LOAD_PATH, or the constant Vectors
+import Vectors (Vec(..), norm)         -- only these
+import Vectors hiding (hidden)         -- all but these
+import qualified Data.Map as M         -- qualification is accepted and ignored
+import Math (hypot)                    -- a plain Ruby module: its singleton methods
+```
+
+A module name resolves to an existing constant (`Data.Tree` is
+`Data::Tree`) or to a file on `$LOAD_PATH` (`Data/Tree.hs`, `Data.Tree.hs`
+or `data/tree.hs`), loaded once with `HaskellMatch.require`. The standard
+library modules (`Data.List`, `Data.Char`, `Data.Maybe`, `Control.Monad`,
+...) are the Prelude: importing one only checks that the named items exist.
+
+An export list (`module Vectors (Vec(..), (<+>), norm) where`) limits what
+importers see; `Mod.haskell_exports` returns it. Everything stays callable
+from Ruby regardless. Compiled code refers to names unqualified, so two
+qualifications of the same name are not distinguished.
 
 ### Semantics worth knowing
 
@@ -1082,9 +1126,12 @@ They are rejected with a clear message.
   provide) is called as a method of the host module, so a module can mix
   `def self.helper` with Haskell that calls `helper`. Ruby lambdas, Procs
   and Methods are Haskell functions (`Mod.my_map(->(x) { x * 2 }, [1, 2])`),
-  and the compiled `Function` objects are available as
-  `Mod.haskell_functions` / `Mod.haskell_function(:name)` for `tail`,
-  `to_proc`, `===` and `decision_tree`.
+  a function returned from Haskell is a Ruby `Proc`, and calling an exported
+  function applies like Haskell: `Mod.add3(1, 2, 3)`, `Mod.add3(1).(2).(3)`
+  (a partial application) and `Mod.adder(5, 10)` (extra arguments go to the
+  returned function) all work. The compiled `Function` objects are available
+  as `Mod.haskell_functions` / `Mod.haskell_function(:name)` for `tail`,
+  `to_proc`, `curried`, `===` and `decision_tree`.
 * **The Prelude** lives in `HaskellMatch::Prelude` and is callable from
   Ruby too (`HaskellMatch::Prelude.take(3, xs)`). It provides the standard
   types `Maybe`, `Either` and `Ordering` (`HaskellMatch::Prelude::Maybe::Just`)

@@ -142,6 +142,8 @@ module HaskellMatch
         constructor_classes.map do |k|
           if k.record?
             "#{k.constructor_name} {#{k.field_names.join(', ')}}"
+          elsif k.constructor_name.start_with?(":") && k.arity == 2
+            "_ #{k.constructor_name} _"
           else
             [k.constructor_name, *Array.new(k.arity, "_")].join(" ")
           end
@@ -150,6 +152,42 @@ module HaskellMatch
   end
 
   class << self
+    SYMBOL_WORDS = {
+      ":" => "Colon", "+" => "Plus", "-" => "Minus", "*" => "Star", "/" => "Slash", "<" => "Lt", ">" => "Gt",
+      "=" => "Eq", "!" => "Bang", "@" => "At", "#" => "Hash", "$" => "Dollar", "%" => "Percent", "&" => "Amp",
+      "^" => "Caret", "|" => "Bar", "~" => "Tilde", "?" => "Query", "." => "Dot", "\\" => "Backslash"
+    }.freeze
+
+    # The Ruby constant for a constructor: its own name, or for an infix
+    # constructor such as `:+:` a spelled-out one (`ColonPlusColon`).
+    def constructor_constant(cname)
+      return cname unless cname.start_with?(":")
+
+      const = cname.chars.map { |c| SYMBOL_WORDS.fetch(c) { "U#{c.ord}" } }.join
+      (@symbolic_constants ||= {})[const] = cname
+      const
+    end
+
+    # The Haskell name of an infix constructor from its spelled-out constant
+    # (`ColonPlusColon` -> `:+:`), or nil.
+    def symbolic_constructor(const_name)
+      (@symbolic_constants ||= {})[const_name.to_s]
+    end
+
+    # Copy the registrations of `type_names` from scope `src` into `dst`
+    # (the Ruby side of `Native.import_scope`).
+    def import_constructors(dst, src, type_names)
+      @constructors ||= {}
+      @type_modules ||= {}
+      (@constructors[src] || {}).each do |n, c|
+        k = c.is_a?(Class) ? c : c.class
+        (@constructors[dst] ||= {})[n] = c if k.respond_to?(:data_type) && type_names.include?(k.data_type.type_name)
+      end
+      (@type_modules[src] || {}).each do |n, m|
+        (@type_modules[dst] ||= {})[n] = m if type_names.include?(n)
+      end
+    end
+
     # Constructor classes and nullary values by name, as currently registered
     # (a redefined type replaces its constructors).
     def constructor(name, scope = Native::GLOBAL_SCOPE)
@@ -209,7 +247,8 @@ module HaskellMatch
         klass.instance_variable_set(:@field_names, fields&.map(&:to_sym))
         klass.instance_variable_set(:@arity, arity)
         klass.instance_variable_set(:@field_types, types&.map(&:to_s))
-        mod.const_set(cname, klass)
+        const = constructor_constant(cname)
+        mod.const_set(const, klass)
         klass.name # cache the permanent name
         FieldTypes.install(klass, types.map(&:to_s), scope) if check_types && types && types.size == arity && arity.positive?
         if arity.zero?
@@ -218,8 +257,8 @@ module HaskellMatch
           klass.singleton_class.send(:undef_method, :new)
           klass.singleton_class.send(:undef_method, :[])
           klass.singleton_class.send(:undef_method, :call)
-          mod.send(:remove_const, cname)
-          mod.const_set(cname, value)
+          mod.send(:remove_const, const)
+          mod.const_set(const, value)
         end
         klass
       end

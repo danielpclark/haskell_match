@@ -456,6 +456,69 @@ fn lex_string(
                 '"' => out.push('"'),
                 '\'' => out.push('\''),
                 '&' => {}
+                // string gap: backslash, whitespace (newlines allowed), backslash
+                ' ' | '\t' | '\n' | '\r' => {
+                    let mut j = i;
+                    while j < chars.len() && matches!(chars[j], ' ' | '\t' | '\n' | '\r') {
+                        j += 1;
+                    }
+                    if j >= chars.len() || chars[j] != '\\' {
+                        return Err(lex_error(
+                            line,
+                            col,
+                            "a string gap must end with a backslash",
+                        ));
+                    }
+                    i = j + 1;
+                    continue;
+                }
+                '^' => {
+                    // control character: \^A .. \^Z, \^@, \^[, \^\\, \^], \^^, \^_
+                    let c2 = chars.get(i + 1).copied().unwrap_or(' ');
+                    let code = match c2 {
+                        '@' => 0,
+                        'A'..='Z' => (c2 as u32) - ('A' as u32) + 1,
+                        '[' => 27,
+                        '\\' => 28,
+                        ']' => 29,
+                        '^' => 30,
+                        '_' => 31,
+                        _ => return Err(lex_error(line, col, "invalid control escape")),
+                    };
+                    out.push(char::from_u32(code).expect("control code"));
+                    i += 2;
+                    continue;
+                }
+                'o' => {
+                    let mut j = i + 1;
+                    let os = j;
+                    while j < chars.len() && chars[j].is_digit(8) {
+                        j += 1;
+                    }
+                    let oct: String = chars[os..j].iter().collect();
+                    let cp = u32::from_str_radix(&oct, 8)
+                        .ok()
+                        .and_then(char::from_u32)
+                        .ok_or_else(|| lex_error(line, col, "invalid octal escape"))?;
+                    out.push(cp);
+                    i = j;
+                    continue;
+                }
+                c2 if c2.is_ascii_uppercase() => {
+                    // ASCII control names: \NUL, \SOH, ..., \DEL (longest match: \SOH before \SO)
+                    let rest: String = chars[i..chars.len().min(i + 3)].iter().collect();
+                    let (name, code) = ASCII_ESCAPES
+                        .iter()
+                        .filter(|(n, _)| rest.starts_with(n))
+                        .max_by_key(|(n, _)| n.len())
+                        .copied()
+                        .ok_or_else(|| {
+                            lex_error(line, col, format!("unknown escape sequence \\{}", c2))
+                        })?;
+                    out.push(char::from_u32(code).expect("ascii code"));
+                    i += name.len();
+                    continue;
+                }
                 'x' => {
                     let mut j = i + 1;
                     let hs = j;
@@ -502,9 +565,57 @@ fn lex_string(
     }
 }
 
+/// Haskell's named ASCII escapes.
+const ASCII_ESCAPES: &[(&str, u32)] = &[
+    ("NUL", 0),
+    ("SOH", 1),
+    ("STX", 2),
+    ("ETX", 3),
+    ("EOT", 4),
+    ("ENQ", 5),
+    ("ACK", 6),
+    ("BEL", 7),
+    ("BS", 8),
+    ("HT", 9),
+    ("LF", 10),
+    ("VT", 11),
+    ("FF", 12),
+    ("CR", 13),
+    ("SO", 14),
+    ("SI", 15),
+    ("DLE", 16),
+    ("DC1", 17),
+    ("DC2", 18),
+    ("DC3", 19),
+    ("DC4", 20),
+    ("NAK", 21),
+    ("SYN", 22),
+    ("ETB", 23),
+    ("CAN", 24),
+    ("EM", 25),
+    ("SUB", 26),
+    ("ESC", 27),
+    ("FS", 28),
+    ("GS", 29),
+    ("RS", 30),
+    ("US", 31),
+    ("SP", 32),
+    ("DEL", 127),
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn escapes_and_gaps() {
+        let t = tokenize(r#""a\o101\ESC\^A\SOH\&b\   \c" 'x' '\'' '\DEL'"#).unwrap();
+        assert_eq!(t[0].tok, Tok::Str("aA\u{1b}\u{1}\u{1}bc".to_string()));
+        assert_eq!(t[1].tok, Tok::Char('x'));
+        assert_eq!(t[2].tok, Tok::Char('\''));
+        assert_eq!(t[3].tok, Tok::Char('\u{7f}'));
+        assert!(tokenize("\"\\q\"").is_err());
+    }
 
     fn toks(s: &str) -> Vec<Tok> {
         tokenize(s).unwrap().into_iter().map(|t| t.tok).collect()
