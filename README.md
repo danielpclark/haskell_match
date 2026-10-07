@@ -1126,9 +1126,12 @@ qualifications of the same name are not distinguished.
   provide) is called as a method of the host module, so a module can mix
   `def self.helper` with Haskell that calls `helper`. Ruby lambdas, Procs
   and Methods are Haskell functions (`Mod.my_map(->(x) { x * 2 }, [1, 2])`),
-  and the compiled `Function` objects are available as
-  `Mod.haskell_functions` / `Mod.haskell_function(:name)` for `tail`,
-  `to_proc`, `===` and `decision_tree`.
+  a function returned from Haskell is a Ruby `Proc`, and calling an exported
+  function applies like Haskell: `Mod.add3(1, 2, 3)`, `Mod.add3(1).(2).(3)`
+  (a partial application) and `Mod.adder(5, 10)` (extra arguments go to the
+  returned function) all work. The compiled `Function` objects are available
+  as `Mod.haskell_functions` / `Mod.haskell_function(:name)` for `tail`,
+  `to_proc`, `curried`, `===` and `decision_tree`.
 * **The Prelude** lives in `HaskellMatch::Prelude` and is callable from
   Ruby too (`HaskellMatch::Prelude.take(3, xs)`). It provides the standard
   types `Maybe`, `Either` and `Ordering` (`HaskellMatch::Prelude::Maybe::Just`)

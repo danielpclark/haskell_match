@@ -207,6 +207,19 @@ module HaskellMatch
         end
       end
 
+      # Call a compiled function from Ruby the way Haskell application
+      # works: exactly `arity` arguments call it; fewer return a partial
+      # application (a curried Proc); more apply the result to the rest.
+      def apply(function, arity, args)
+        if args.size == arity
+          function.(*args)
+        elsif args.size < arity
+          args.inject(function.curried) { |f, x| f.(x) }
+        else
+          args.drop(arity).inject(function.(*args.first(arity))) { |f, x| f.(x) }
+        end
+      end
+
       # Parse Haskell source into its JSON AST (a Hash).
       def parse(source, file = "(haskell)", line_offset = 0)
         JSON.parse(Native.parse_haskell(source))

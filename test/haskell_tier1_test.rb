@@ -206,6 +206,31 @@ class HaskellTier1Test < Minitest::Test
     assert_raises(ArgumentError) { hs("data P = P { a :: Int, b :: Int }\nf = P { a = 1 }").f } # missing field
   end
 
+  def test_functions_apply_like_haskell_from_ruby
+    m = hs(<<~'HS')
+      add3 :: Int -> Int -> Int -> Int
+      add3 a b c = a + b + c
+
+      adder :: Int -> (Int -> Int)
+      adder n = \x -> x + n
+
+      twice :: (a -> a) -> a -> a
+      twice f = f . f
+    HS
+    assert_equal 6, m.add3(1, 2, 3)                      # saturated
+    assert_equal 6, m.add3(1).(2).(3)                    # fewer arguments: a curried partial application
+    assert_equal 6, m.add3(1, 2).(3)
+    assert_kind_of Proc, m.add3
+    assert_equal 6, m.add3.(1).(2).(3)
+    assert_equal 15, m.adder(5).(10)                     # a lambda returned from Haskell is a Proc
+    assert_equal 15, m.adder(5, 10)                      # extra arguments apply to the result
+    assert_equal "hi!!", m.twice(->(s) { s + "!" }, "hi") # Ruby lambdas are Haskell functions
+    assert_equal "hi!!", m.twice(->(s) { s + "!" }).("hi")
+    assert_equal [2, 3], [1, 2].map(&m.adder(1))
+    assert_equal 6, m.haskell_function(:add3).curried.(1).(2).(3)
+    assert_equal 6, m.haskell_function(:add3).to_proc.(1, 2, 3)
+  end
+
   def test_literal_escapes_and_numeric_forms
     m = hs(<<~'HS')
       esc :: String

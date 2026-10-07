@@ -17,6 +17,9 @@ All notable changes to haskell_match are recorded here. The format follows
   `MultiWayIf`, `LambdaCase`, `TupleSections` and `NamedFieldPuns`; the
   full set of character escapes and string gaps; left sections (previously
   mis-parsed).
+- Exported Haskell functions apply like Haskell from Ruby: fewer arguments
+  than the arity return a curried partial application, more arguments are
+  applied to the returned function (`HaskellMatch::Haskell.apply`).
 - **Modules.** `import` declarations between compiled modules (items,
   `hiding`, qualified/`as` accepted), with imported types joining the
   importing module's type scope (`Native.import_scope`,

@@ -209,7 +209,7 @@ module HaskellMatch
           #{ivar} = HaskellMatch.fn(#{rb_str(name)}, exhaustive: #{@exhaustive.inspect}, scope: haskell_scope) do |m|
           #{clauses}
           end
-          define_singleton_method(#{name.to_sym.inspect}) { |*a| a.size == #{d['arity']} ? #{ivar}.(*a) : a.drop(#{d['arity']}).inject(#{ivar}.(*a.first(#{d['arity']}))) { |f, x| f.(x) } }
+          define_singleton_method(#{name.to_sym.inspect}) { |*a| HaskellMatch::Haskell.apply(#{ivar}, #{d['arity']}, a) }
           #{snake(name) == name ? '' : "singleton_class.alias_method(#{snake(name).to_sym.inspect}, #{name.to_sym.inspect})"}
         RUBY
       end
