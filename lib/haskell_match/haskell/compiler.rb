@@ -63,8 +63,18 @@ module HaskellMatch
         @values = {} # name => method name for top-level values
         @con_arity = {} # constructor name => arity
         @local_cons = [] # constructors declared by this module
+        @local_types = [] # type names declared by this module
         @lines = {} # function name => source line of its first equation
         @lifted_lines = {} # the same for where/let-bound functions
+        # functions and values the host already has (imports, or an earlier
+        # `haskell` call on the same module) are callable like local ones
+        imports = host.respond_to?(:haskell_imports) ? host.haskell_imports : {}
+        if host.respond_to?(:haskell_functions)
+          host.haskell_functions.each do |n, f|
+            @top[n] = { ivar: "@__haskell_functions__[#{rb_str(n)}]", arity: f.arity }
+          end
+        end
+        imports.each { |n, kind| @values[n] = n if kind == :value && !@top.key?(n) }
       end
 
       # Generate the Ruby source for the module.
@@ -87,7 +97,7 @@ module HaskellMatch
             unless pat["vars"].size == 1 && pat["text"] == mangle(pat["vars"][0])
               raise DefinitionError, "#{@source_name}:#{ln(d['line'])}: only simple names can be bound at top level (got #{pat['text']})"
             end
-            @values[pat["vars"][0]] = "hs_value_#{pat['vars'][0]}"
+            @values[pat["vars"][0]] = "hs_value_#{rb_ident(pat['vars'][0])}"
           end
         end
         body = []
@@ -99,6 +109,10 @@ module HaskellMatch
         end
         table = @top.map { |n, info| "#{rb_str(n)} => #{info[:ivar]}" }.join(", ")
         body << "(@__haskell_functions__ ||= {}).merge!({ #{table} })"
+        values = @values.map { |n, m| "#{rb_str(n)} => #{m.to_sym.inspect}" }.join(", ")
+        body << "(@__haskell_values__ ||= {}).merge!({ #{values} })"
+        body << "(@__haskell_types__ ||= []).concat(#{@local_types.inspect}).uniq!"
+        body << "@__haskell_exports__ = #{@ast['exports'].inspect}" if @ast["exports"]
         (out + @lifted + body).join("\n")
       end
 
@@ -119,7 +133,29 @@ module HaskellMatch
       end
 
       def ivar_for(name)
-        "@hs_fn_#{name.gsub("'", "_q")}"
+        "@hs_fn_#{rb_ident(name)}"
+      end
+
+      SYMBOL_WORDS = {
+        ":" => "colon", "+" => "plus", "-" => "minus", "*" => "star", "/" => "slash", "<" => "lt", ">" => "gt",
+        "=" => "eq", "!" => "bang", "@" => "at", "#" => "hash", "$" => "dollar", "%" => "percent", "&" => "amp",
+        "^" => "caret", "|" => "bar", "~" => "tilde", "?" => "query", "." => "dot", "\\" => "backslash"
+      }.freeze
+
+      # A Haskell function or operator name as a Ruby identifier fragment.
+      def rb_ident(name)
+        return name.gsub("'", "_q") if name.match?(/\A[A-Za-z_]/)
+
+        "op_" + name.chars.map { |c| SYMBOL_WORDS.fetch(c) { "u#{c.ord}" } }.join("_")
+      end
+
+      def symbolic?(name)
+        !name.match?(/\A[A-Za-z_]/)
+      end
+
+      # A user-defined function or operator visible from `scope`.
+      def user_function?(name, scope)
+        !scope.lookup_fun(name).nil? || @top.key?(name) || @values.key?(name)
       end
 
       def snake(name)
@@ -133,18 +169,27 @@ module HaskellMatch
       # ------------------------------------------------------------ declarations
 
       def data_decl(d)
+        @local_types << d["name"]
+        selectors = []
         cons = d["cons"].map do |c|
           @con_arity[c["name"]] = c["arity"]
           @local_cons << c["name"]
+          selectors |= c["fields"] if c["fields"]
+          shown = c["name"].start_with?(":") ? "(#{c['name']})" : c["name"]
           if c["fields"]
-            "#{c['name']} { #{c['fields'].map { |f| "#{f} :: T" }.join(', ')} }"
+            "#{shown} { #{c['fields'].map { |f| "#{f} :: T" }.join(', ')} }"
           else
-            ([c["name"]] + Array.new(c["arity"], "t")).join(" ")
+            ([shown] + Array.new(c["arity"], "t")).join(" ")
           end
         end
         deriving = d["deriving"].empty? ? "" : " deriving (#{d['deriving'].join(', ')})"
         decl = "#{([d['name']] + d['tyvars']).join(' ')} = #{cons.join(' | ')}#{deriving}"
-        "include HaskellMatch.data(#{rb_str(decl)}, under: self, scope: haskell_scope)"
+        lines = ["include HaskellMatch.data(#{rb_str(decl)}, under: self, scope: haskell_scope)"]
+        # record fields are selector functions, as in Haskell
+        selectors.each do |f|
+          lines << "define_singleton_method(#{f.to_sym.inspect}) { |v| v.public_send(#{f.to_sym.inspect}) } unless singleton_class.method_defined?(#{f.to_sym.inspect})"
+        end
+        lines.join("\n")
       end
 
       def con_arity(name)
@@ -164,7 +209,7 @@ module HaskellMatch
           #{ivar} = HaskellMatch.fn(#{rb_str(name)}, exhaustive: #{@exhaustive.inspect}, scope: haskell_scope) do |m|
           #{clauses}
           end
-          define_singleton_method(#{name.to_sym.inspect}) { |*a| #{ivar}.(*a) }
+          define_singleton_method(#{name.to_sym.inspect}) { |*a| a.size == #{d['arity']} ? #{ivar}.(*a) : a.drop(#{d['arity']}).inject(#{ivar}.(*a.first(#{d['arity']}))) { |f, x| f.(x) } }
           #{snake(name) == name ? '' : "singleton_class.alias_method(#{snake(name).to_sym.inspect}, #{name.to_sym.inspect})"}
         RUBY
       end
@@ -206,20 +251,87 @@ module HaskellMatch
           body = expr(rhs["body"], scope, tail: true)
           "  m.on(#{pat_texts.join(', ')}#{loc}) { #{param_list} #{where_code}#{body} }"
         else
-          rhs["guards"].map do |(g, e)|
-            body = expr(e, scope, tail: true)
-            if otherwise?(g)
+          rhs["guards"].map do |(quals, e)|
+            if otherwise?(quals)
+              body = expr(e, scope, tail: true)
               "  m.on(#{pat_texts.join(', ')}#{loc}) { #{param_list} #{where_code}#{body} }"
+            elsif simple_guards?(quals)
+              body = expr(e, scope, tail: true)
+              guard = quals.map { |q| "(#{expr(q[1], scope, tail: false)})" }.join(" && ")
+              "  m.on(#{pat_texts.join(', ')}, guard: ->(#{param_list.delete('|')}) { #{where_code}#{guard} }#{loc}) { #{param_list} #{where_code}#{body} }"
             else
-              guard = expr(g, scope, tail: false)
+              # pattern guards / let guards: the guard lambda runs the
+              # qualifiers for their truth; the body runs them again for
+              # their bindings (Haskell code is pure, so this is sound).
+              gscope = Scope.new({}, {}, scope)
+              guard = qual_chain(quals, gscope) { "true" }
+              bscope = Scope.new({}, {}, scope)
+              body = qual_chain(quals, bscope) { expr(e, bscope, tail: true) }
               "  m.on(#{pat_texts.join(', ')}, guard: ->(#{param_list.delete('|')}) { #{where_code}#{guard} }#{loc}) { #{param_list} #{where_code}#{body} }"
             end
           end.join("\n")
         end
       end
 
-      def otherwise?(g)
+      # `| otherwise` / `| True`: an unconditional alternative.
+      def otherwise?(quals)
+        return false unless quals.size == 1 && quals[0][0] == "guard"
+
+        g = quals[0][1]
         (g[0] == "var" && g[1] == "otherwise") || (g[0] == "con" && g[1] == "True")
+      end
+
+      def simple_guards?(quals)
+        quals.all? { |q| q[0] == "guard" }
+      end
+
+      # Qualifiers (boolean guards, `pat <- e` generators binding variables,
+      # `let` bindings) as nested Ruby expressions ending in `final`; a
+      # failing guard or pattern yields `false`.
+      def qual_chain(quals, scope, &final)
+        return final.call if quals.empty?
+
+        q, *rest = quals
+        case q[0]
+        when "guard"
+          "((#{expr(q[1], scope, tail: false)}) ? (#{qual_chain(rest, scope, &final)}) : false)"
+        when "gen"
+          src = expr(q[2], scope, tail: false)
+          pat = q[1]
+          if pat["vars"].size == 1 && pat["text"] == mangle(pat["vars"][0])
+            name = fresh(mangle(pat["vars"][0]))
+            scope.vars[pat["vars"][0]] = name
+            "(#{name} = #{src}; #{qual_chain(rest, scope, &final)})"
+          else
+            matcher = "@hs_pat_#{fresh('guard')}"
+            @lifted << "#{matcher} = HaskellMatch.pattern(#{rb_str(pat['text'])}, scope: haskell_scope)"
+            binds = fresh("hs_b")
+            pat["vars"].each { |v| scope.vars[v] = "#{binds}[#{mangle(v).to_sym.inspect}]" }
+            "((#{binds} = #{matcher}.match(#{src})) ? (#{qual_chain(rest, scope, &final)}) : false)"
+          end
+        when "let"
+          "(#{where_bindings(q[1], scope)}#{qual_chain(rest, scope, &final)})"
+        else
+          raise DefinitionError, "#{@source_name}: unknown qualifier #{q[0]}"
+        end
+      end
+
+      # Guarded alternatives as one expression: `[quals, e]` arms tried in
+      # order, `fallback` when none applies.
+      def guard_chain(arms, scope, tail, fallback)
+        chain = arms.map do |(quals, e)|
+          if otherwise?(quals)
+            "true ? (#{expr(e, scope, tail: tail)}) : "
+          elsif simple_guards?(quals)
+            conds = quals.map { |q| "(#{expr(q[1], scope, tail: false)})" }.join(" && ")
+            "(#{conds}) ? (#{expr(e, scope, tail: tail)}) : "
+          else
+            s = Scope.new({}, {}, scope)
+            tmp = fresh("hs_g")
+            "((#{tmp} = #{qual_chain(quals, s) { "[#{expr(e, s, tail: tail)}]" }})) ? (#{tmp}[0]) : "
+          end
+        end.join
+        "(#{chain}#{fallback})"
       end
 
       # Right-hand side as a single Ruby expression (for values and lifted
@@ -229,11 +341,8 @@ module HaskellMatch
         if rhs.key?("body")
           "#{where_code}#{expr(rhs['body'], scope, tail: tail)}"
         else
-          chain = rhs["guards"].map do |(g, e)|
-            cond = otherwise?(g) ? "true" : expr(g, scope, tail: false)
-            "(#{cond}) ? (#{expr(e, scope, tail: tail)}) : "
-          end.join
-          "#{where_code}(#{chain}raise(HaskellMatch::Prelude::HaskellError, #{rb_str("#{@source_name}:#{line}: non-exhaustive guards")}))"
+          fallback = "raise(HaskellMatch::Prelude::HaskellError, #{rb_str("#{@source_name}:#{line}: non-exhaustive guards")})"
+          "#{where_code}#{guard_chain(rhs['guards'], scope, tail, fallback)}"
         end
       end
 
@@ -335,7 +444,7 @@ module HaskellMatch
           break unless changed
         end
         funs.each do |d|
-          ivar = "@hs_lift_#{fresh(d['name'].gsub("'", '_q'))}"
+          ivar = "@hs_lift_#{fresh(rb_ident(d['name']))}"
           scope.funs[d["name"]] = { ivar: ivar, arity: d["arity"], free: free[d["name"]] }
         end
         funs.each do |d|
@@ -356,9 +465,12 @@ module HaskellMatch
       # Haskell variables referenced in an rhs that are bound in `scope` as
       # local vars/funs (i.e. would need to be passed to a lifted function).
       def collect_free(rhs, wheres, bound, scope, out)
-        exprs = rhs.key?("body") ? [rhs["body"]] : rhs["guards"].flatten(1)
         where_bound = (wheres || []).flat_map { |d| d["kind"] == "fun" ? [d["name"]] : d["kind"] == "bind" ? d["pat"]["vars"] : [] }
-        exprs.each { |e| free_in(e, bound + where_bound, scope, out) }
+        if rhs.key?("body")
+          free_in(rhs["body"], bound + where_bound, scope, out)
+        else
+          rhs["guards"].each { |(quals, e)| free_in_quals(quals, e, bound + where_bound, scope, out) }
+        end
         (wheres || []).each do |d|
           case d["kind"]
           when "fun"
@@ -369,6 +481,33 @@ module HaskellMatch
             collect_free(d["rhs"], d["where"], bound + where_bound, scope, out)
           end
         end
+      end
+
+      # Free variables of qualifiers followed by `body`; generator patterns
+      # and let bindings bind names for what follows them.
+      def free_in_quals(quals, body, bound, scope, out)
+        b = bound.dup
+        quals.each do |q|
+          case q[0]
+          when "guard" then free_in(q[1], b, scope, out)
+          when "gen"
+            free_in(q[2], b, scope, out)
+            b += q[1]["vars"]
+          when "let"
+            names = q[1].flat_map { |d| d["kind"] == "fun" ? [d["name"]] : d["kind"] == "bind" ? d["pat"]["vars"] : [] }
+            q[1].each do |d|
+              case d["kind"]
+              when "fun"
+                d["equations"].each do |eq|
+                  collect_free(eq["rhs"], eq["where"], b + names + eq["pats"].flat_map { |p| p["vars"] }, scope, out)
+                end
+              when "bind" then collect_free(d["rhs"], d["where"], b + names, scope, out)
+              end
+            end
+            b += names
+          end
+        end
+        free_in(body, b, scope, out)
       end
 
       def free_in(e, bound, scope, out)
@@ -382,11 +521,20 @@ module HaskellMatch
           elsif (f = scope.lookup_fun(name))
             f[:free].each { |v| out << v unless out.include?(v) || bound.include?(v) }
           end
-        when "con", "lit", "opfun" then nil
+        when "con", "lit" then nil
+        when "opfun"
+          free_in(["var", e[1]], bound, scope, out) if user_function?(e[1], scope) || scope.lookup_var(e[1])
+        when "multiif"
+          e[1].each { |(quals, body)| free_in_quals(quals, body, bound, scope, out) }
+        when "reccon" then e[2].each { |(_, v)| free_in(v, bound, scope, out) }
+        when "recupd"
+          free_in(e[1], bound, scope, out)
+          e[2].each { |(_, v)| free_in(v, bound, scope, out) }
         when "app"
           free_in(e[1], bound, scope, out)
           e[2].each { |a| free_in(a, bound, scope, out) }
         when "op"
+          free_in(["var", e[1]], bound, scope, out) if user_function?(e[1], scope)
           free_in(e[2], bound, scope, out)
           free_in(e[3], bound, scope, out)
         when "neg" then free_in(e[1], bound, scope, out)
@@ -432,8 +580,11 @@ module HaskellMatch
 
       # All variable names referenced (for sibling closure), ignoring scope.
       def collect_refs(rhs, wheres, bound, out)
-        exprs = rhs.key?("body") ? [rhs["body"]] : rhs["guards"].flatten(1)
-        exprs.each { |e| refs_in(e, out) }
+        if rhs.key?("body")
+          refs_in(rhs["body"], out)
+        else
+          rhs["guards"].each { |(quals, e)| refs_in_quals(quals, e, bound, out) }
+        end
         (wheres || []).each do |d|
           case d["kind"]
           when "fun" then d["equations"].each { |eq| collect_refs(eq["rhs"], eq["where"], bound, out) }
@@ -442,11 +593,30 @@ module HaskellMatch
         end
       end
 
+      def refs_in_quals(quals, body, bound, out)
+        quals.each do |q|
+          case q[0]
+          when "guard" then refs_in(q[1], out)
+          when "gen" then refs_in(q[2], out)
+          when "let" then collect_refs({ "body" => ["lit", ["int", "0"]] }, q[1], bound, out)
+          end
+        end
+        refs_in(body, out)
+      end
+
       def refs_in(e, out)
         case e[0]
         when "var" then out << e[1]
+        when "op"
+          out << e[1]
+          [e[2], e[3]].each { |x| refs_in(x, out) }
+        when "opfun" then out << e[1]
+        when "multiif" then e[1].each { |(quals, body)| refs_in_quals(quals, body, [], out) }
+        when "reccon" then e[2].each { |(_, v)| refs_in(v, out) }
+        when "recupd"
+          refs_in(e[1], out)
+          e[2].each { |(_, v)| refs_in(v, out) }
         when "app" then (e[2] + [e[1]]).each { |x| refs_in(x, out) }
-        when "op" then [e[2], e[3]].each { |x| refs_in(x, out) }
         when "neg", "section_l", "section_r" then refs_in(e[-1], out)
         when "if", "list", "tuple" then e[1..].flatten(1).each { |x| refs_in(x, out) if x.is_a?(Array) && x[0].is_a?(String) }
         when "case"
@@ -488,14 +658,28 @@ module HaskellMatch
           args << expr(e[3], scope, tail: false) if e[3]
           "HaskellMatch::Prelude.range(#{args.join(', ')})"
         when "comp" then comprehension(e[1], e[2], scope)
+        when "multiif"
+          fallback = "raise(HaskellMatch::Prelude::HaskellError, #{rb_str("#{@source_name}: non-exhaustive guards in multi-way if")})"
+          guard_chain(e[1], scope, tail, fallback)
+        when "reccon"
+          name = e[1]
+          raise UnknownConstructorError, "#{@source_name}: not in scope: data constructor '#{name}'" if con_arity(name).nil?
+
+          fields = e[2].map { |(f, v)| "#{f.to_sym.inspect} => #{expr(v, scope, tail: false)}" }
+          "#{con_path(name)}.new(#{fields.join(', ')})"
+        when "recupd"
+          fields = e[2].map { |(f, v)| "#{f.to_sym.inspect} => #{expr(v, scope, tail: false)}" }
+          "#{expr(e[1], scope, tail: false)}.with(#{fields.join(', ')})"
         when "section_l"
           # (e op) = \y -> e op y
           y = fresh("hs_sec")
-          "->(#{y}) { #{binop_code(e[1], expr(e[2], scope, tail: false), y)} }"
+          inner = Scope.new({ "__sec" => y }, {}, scope)
+          "->(#{y}) { #{binop(e[1], e[2], ['var', '__sec'], inner, false)} }"
         when "section_r"
           x = fresh("hs_sec")
-          "->(#{x}) { #{binop_code(e[1], x, expr(e[2], scope, tail: false))} }"
-        when "opfun" then op_value(e[1])
+          inner = Scope.new({ "__sec" => x }, {}, scope)
+          "->(#{x}) { #{binop(e[1], ['var', '__sec'], e[2], inner, false)} }"
+        when "opfun" then op_value(e[1], scope)
         else raise DefinitionError, "#{@source_name}: unknown expression node #{e[0]}"
         end
       end
@@ -550,7 +734,7 @@ module HaskellMatch
       def con_path(name)
         return name.downcase if %w[True False].include?(name)
         return "[]" if name == "[]"
-        return name if @con_arity.key?(name) && @local_cons.include?(name)
+        return HaskellMatch.constructor_constant(name) if @con_arity.key?(name) && @local_cons.include?(name)
 
         reg = HaskellMatch.constructor(name, @scope)
         raise UnknownConstructorError, "#{@source_name}: not in scope: data constructor '#{name}'" if reg.nil?
@@ -558,7 +742,12 @@ module HaskellMatch
         (reg.is_a?(Class) ? reg : reg.class).name
       end
 
-      def op_value(op)
+      # `(op)` as a value: a constructor, a user-defined function or
+      # operator, or a Prelude operator.
+      def op_value(op, scope)
+        return con_value(op) if op.start_with?(":") && op != ":"
+        return var(op, scope) if user_function?(op, scope) || !symbolic?(op)
+
         "HaskellMatch::Prelude.op(#{rb_str(op)})"
       end
 
@@ -585,6 +774,8 @@ module HaskellMatch
             end
             if !@values.key?(name) && !scope.shadowed?(name) && !Prelude.known?(name.to_sym)
               # foreign Ruby method on the host module
+              return "__send__(#{name.to_sym.inspect}, #{arg_code.join(', ')})" if symbolic?(name)
+
               return "#{name}(#{arg_code.join(', ')})"
             end
           end
@@ -628,6 +819,12 @@ module HaskellMatch
       end
 
       def binop(op, l, r, scope, tail)
+        # an infix constructor builds a value; a user-defined operator or a
+        # backticked function is an ordinary call
+        return application(["con", op], [l, r], scope, tail) if op.start_with?(":") && op != ":"
+        return application(["var", op], [l, r], scope, tail) if user_function?(op, scope)
+        return application(["var", op], [l, r], scope, tail) if !symbolic?(op) && op != "seq"
+
         if op == "$"
           # f $ x  ==  f x
           return application(l, [r], scope, tail) if l[0] == "var" || l[0] == "con"

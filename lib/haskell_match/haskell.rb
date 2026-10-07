@@ -65,6 +65,26 @@ module HaskellMatch
       (@__haskell_functions__ ||= {}).dup
     end
 
+    # Top-level values by Haskell name (to the Ruby method that memoises them).
+    def haskell_values
+      (@__haskell_values__ ||= {}).dup
+    end
+
+    # Names of the data types the module declares.
+    def haskell_types
+      (@__haskell_types__ ||= []).dup
+    end
+
+    # The module's export list, or nil when everything is exported.
+    def haskell_exports
+      @__haskell_exports__
+    end
+
+    # Names brought in by imports, to :function or :value.
+    def haskell_imports
+      (@__haskell_imports__ ||= {}).dup
+    end
+
     # One compiled function, as a {Function}.
     def haskell_function(name)
       (@__haskell_functions__ ||= {}).fetch(name.to_s) do
@@ -80,6 +100,13 @@ module HaskellMatch
         offset = line || 0
         ast ||= parse(source, file, offset)
         host.extend(Haskell) unless host.singleton_class.include?(Haskell)
+        # imports first: the generator resolves imported constructors
+        ast["decls"].each do |d|
+          next unless d["kind"] == "import"
+
+          import_into(host, d["module"], qualified: d["qualified"], as: d["as"], hiding: d["hiding"],
+                                         items: d["items"], file: file, line: d["line"] + offset)
+        end
         compiler = Compiler.new(ast, host, source_name: file, exhaustive: exhaustive, line_offset: offset,
                                            scope: host.haskell_scope)
         ruby = compiler.generate
@@ -93,6 +120,91 @@ module HaskellMatch
         host.instance_variable_set(:@__haskell_source__, (host.instance_variable_get(:@__haskell_source__) || []) << source)
         host.instance_variable_set(:@__haskell_ruby__, (host.instance_variable_get(:@__haskell_ruby__) || []) << ruby)
         ast["name"]
+      end
+
+      # Bring another module's functions, values and types into `host`, as
+      # `import M [qualified] [as A] [hiding] [(items)]` does: functions and
+      # values become forwarding methods, types join the host's type scope
+      # and their constructors become constants.  `source` is a module or a
+      # Haskell module name, resolved to a constant (`Data.Tree` is
+      # `Data::Tree`) or loaded from `Data/Tree.hs` on `$LOAD_PATH`.
+      # Qualification is accepted and ignored: compiled code refers to names
+      # unqualified.
+      # Standard library modules whose functions the Prelude provides; importing
+      # them only checks the named items exist.
+      STANDARD_MODULES = %w[
+        Prelude Data.Char Data.List Data.Maybe Data.Either Data.Function Data.Ord Data.Tuple Data.Bool
+        Data.Foldable Data.Traversable Control.Monad Numeric Data.String Data.Ratio Data.Int Data.Word
+      ].freeze
+
+      def import_into(host, source, qualified: false, as: nil, hiding: false, items: nil, file: nil, line: nil)
+        _ = [qualified, as]
+        if source.is_a?(String) && STANDARD_MODULES.include?(source)
+          unknown = (items || []) - Prelude::ARITY.keys.map(&:to_s)
+          unless unknown.empty?
+            where = file ? "#{file}:#{line}: " : ""
+            raise HaskellSyntaxError, "#{where}module #{source} does not export #{unknown.join(', ')} (not in this Prelude)"
+          end
+          return Prelude
+        end
+        mod = source.is_a?(Module) ? source : resolve_module(source.to_s, file, line)
+        host.extend(Haskell) unless host.singleton_class.include?(Haskell)
+        functions = mod.respond_to?(:haskell_functions) ? mod.haskell_functions : {}
+        values = mod.respond_to?(:haskell_values) ? mod.haskell_values : {}
+        types = mod.respond_to?(:haskell_types) ? mod.haskell_types : []
+        names = functions.keys + values.keys + types
+        names = mod.singleton_methods(false).map(&:to_s) if names.empty? # a plain Ruby module
+        if mod.respond_to?(:haskell_exports) && mod.haskell_exports
+          names &= mod.haskell_exports
+        end
+        if items
+          unknown = items - names
+          unless unknown.empty? || hiding
+            where = file ? "#{file}:#{line}: " : ""
+            raise HaskellSyntaxError, "#{where}module #{mod} does not export #{unknown.join(', ')}"
+          end
+          names = hiding ? names - items : names & items
+        end
+        table = host.instance_variable_get(:@__haskell_functions__) || host.instance_variable_set(:@__haskell_functions__, {})
+        imports = host.instance_variable_get(:@__haskell_imports__) || host.instance_variable_set(:@__haskell_imports__, {})
+        names.each do |n|
+          next if types.include?(n)
+
+          host.define_singleton_method(n) { |*a| mod.public_send(n, *a) }
+          table[n] = functions[n] if functions.key?(n)
+          imports[n] = values.key?(n) ? :value : :function
+        end
+        imported_types = names & types
+        unless imported_types.empty?
+          Native.import_scope(host.haskell_scope, mod.haskell_scope, imported_types)
+          HaskellMatch.import_constructors(host.haskell_scope, mod.haskell_scope, imported_types)
+          imported_types.each do |t|
+            next unless mod.const_defined?(t, false)
+
+            tm = mod.const_get(t, false)
+            host.const_set(t, tm) unless host.const_defined?(t, false)
+            host.include(tm) if tm.instance_of?(Module)
+          end
+        end
+        mod
+      end
+
+      # A module by Haskell name: an existing constant, or a `.hs` file.
+      def resolve_module(name, file = nil, line = nil)
+        const = name.split(".").inject(Object) do |ns, part|
+          break nil unless ns.const_defined?(part, false)
+
+          ns.const_get(part, false)
+        end
+        return const if const.is_a?(Module)
+
+        begin
+          HaskellMatch.require(name)
+        rescue LoadError
+          where = file ? "#{file}:#{line}: " : ""
+          raise HaskellSyntaxError,
+                "#{where}cannot find module #{name}: no constant #{name.gsub('.', '::')} and no #{name.gsub('.', '/')}.hs on $LOAD_PATH"
+        end
       end
 
       # Parse Haskell source into its JSON AST (a Hash).
@@ -185,7 +297,9 @@ module HaskellMatch
 
     def resolve_hs(name)
       name = name.to_s
-      candidates = [name, "#{name}.hs"]
+      slashed = name.gsub(".", "/")
+      snake = slashed.gsub(/([a-z\d])([A-Z])/, '\1_\2').downcase
+      candidates = [name, "#{name}.hs", "#{slashed}.hs", "#{snake}.hs"].uniq
       candidates.each { |c| return File.expand_path(c) if File.file?(c) }
       $LOAD_PATH.each do |dir|
         candidates.each do |c|

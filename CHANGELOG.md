@@ -8,6 +8,23 @@ All notable changes to haskell_match are recorded here. The format follows
 
 ### Added
 
+- **Haskell tier 1.** User-defined operators with `infixl`/`infixr`/`infix`
+  declarations (prefix, infix and backtick definitions; sections, operator
+  values, `where`-bound operators; callable from Ruby); infix constructors
+  (`data V = Double :| Double`, `(:+:) a b`, infix rendering) in Haskell
+  source and in `HaskellMatch.data`; record field selectors, record
+  construction and update syntax; pattern guards and `let` guards;
+  `MultiWayIf`, `LambdaCase`, `TupleSections` and `NamedFieldPuns`; the
+  full set of character escapes and string gaps; left sections (previously
+  mis-parsed).
+- **Modules.** `import` declarations between compiled modules (items,
+  `hiding`, qualified/`as` accepted), with imported types joining the
+  importing module's type scope (`Native.import_scope`,
+  `HaskellMatch::Haskell.import_into`), export lists (`haskell_exports`),
+  `haskell_values`, `haskell_types`, `haskell_imports`, module names
+  resolving to constants or `Dir/File.hs` on `$LOAD_PATH`, and standard
+  library module names resolving to the Prelude.
+
 - **Inline Haskell.** `HaskellMatch.haskell(source)` compiles a Haskell 2010
   subset (data declarations, equations, guards, `where`, `let`, `case`,
   lambdas, sections, list comprehensions, ranges) into methods on a Ruby

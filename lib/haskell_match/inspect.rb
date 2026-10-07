@@ -33,6 +33,9 @@ module HaskellMatch
       if fields
         inner = fields.zip(values).map { |f, v| "#{f} = #{render(v)}" }.join(", ")
         "#{name} {#{inner}}"
+      elsif name.to_s.start_with?(":") && values.size == 2
+        s = "#{render(values[0], atomic: true)} #{name} #{render(values[1], atomic: true)}"
+        atomic ? "(#{s})" : s
       else
         s = "#{name} #{values.map { |v| render(v, atomic: true) }.join(' ')}"
         atomic ? "(#{s})" : s

@@ -47,6 +47,16 @@ fn literal(l: &Literal) -> String {
 pub fn expr(e: &Expr) -> String {
     match e {
         Expr::Var(v) => format!("[\"var\",{}]", esc(v)),
+        Expr::RecCon(c, fields) => format!(
+            "[\"reccon\",{},{}]",
+            esc(c),
+            arr(fields.iter().map(field_bind).collect())
+        ),
+        Expr::RecUpdate(e, fields) => format!(
+            "[\"recupd\",{},{}]",
+            expr(e),
+            arr(fields.iter().map(field_bind).collect())
+        ),
         Expr::Con(c) => format!("[\"con\",{}]", esc(c)),
         Expr::Lit(l) => format!("[\"lit\",{}]", literal(l)),
         Expr::App(f, args) => format!(
@@ -92,7 +102,19 @@ pub fn expr(e: &Expr) -> String {
         Expr::SectionL(op, x) => format!("[\"section_l\",{},{}]", esc(op), expr(x)),
         Expr::SectionR(op, x) => format!("[\"section_r\",{},{}]", esc(op), expr(x)),
         Expr::OpFun(op) => format!("[\"opfun\",{}]", esc(op)),
+        Expr::MultiIf(arms) => format!(
+            "[\"multiif\",{}]",
+            arr(arms.iter().map(guarded_arm).collect())
+        ),
     }
+}
+
+fn field_bind((f, e): &(String, Expr)) -> String {
+    format!("[{},{}]", esc(f), expr(e))
+}
+
+fn guarded_arm((quals, e): &(Vec<Qual>, Expr)) -> String {
+    format!("[{},{}]", arr(quals.iter().map(qual).collect()), expr(e))
 }
 
 fn qual(q: &Qual) -> String {
@@ -108,10 +130,7 @@ fn rhs(r: &Rhs) -> String {
         Rhs::Plain(e) => format!("{{\"body\":{}}}", expr(e)),
         Rhs::Guarded(gs) => format!(
             "{{\"guards\":{}}}",
-            arr(gs
-                .iter()
-                .map(|(g, e)| format!("[{},{}]", expr(g), expr(e)))
-                .collect())
+            arr(gs.iter().map(guarded_arm).collect())
         ),
     }
 }
@@ -175,15 +194,31 @@ pub fn decl(d: &Decl) -> String {
             arr(wheres.iter().map(decl).collect()),
             line
         ),
+        Decl::Import { module, qualified, alias, hiding, items, line } => format!(
+            "{{\"kind\":\"import\",\"module\":{},\"qualified\":{},\"as\":{},\"hiding\":{},\"items\":{},\"line\":{}}}",
+            esc(module),
+            qualified,
+            alias.as_ref().map(|a| esc(a)).unwrap_or_else(|| "null".into()),
+            hiding,
+            items
+                .as_ref()
+                .map(|is| arr(is.iter().map(|i| esc(i)).collect()))
+                .unwrap_or_else(|| "null".into()),
+            line
+        ),
     }
 }
 
 pub fn module(m: &Module) -> String {
     format!(
-        "{{\"name\":{},\"decls\":{}}}",
+        "{{\"name\":{},\"exports\":{},\"decls\":{}}}",
         m.name
             .as_ref()
             .map(|n| esc(n))
+            .unwrap_or_else(|| "null".into()),
+        m.exports
+            .as_ref()
+            .map(|es| arr(es.iter().map(|e| esc(e)).collect()))
             .unwrap_or_else(|| "null".into()),
         arr(m.decls.iter().map(decl).collect())
     )

@@ -90,9 +90,14 @@ module HaskellMatch
       end
 
       def to_haskell(atomic = false)
-        return name if args.empty?
+        hs = HaskellMatch.symbolic_constructor(name) || name
+        return hs if args.empty?
 
-        s = "#{name} #{args.map { |a| PatternAST.render(a, true) }.join(' ')}"
+        s = if hs.start_with?(":") && args.size == 2
+              "#{PatternAST.render(args[0], true)} #{hs} #{PatternAST.render(args[1], true)}"
+            else
+              "#{hs.start_with?(':') ? "(#{hs})" : hs} #{args.map { |a| PatternAST.render(a, true) }.join(' ')}"
+            end
         atomic ? "(#{s})" : s
       end
     end
@@ -270,7 +275,11 @@ module HaskellMatch
       fields = value.fields
       return name if fields.empty?
 
-      s = "#{name} #{fields.map { |f| render(f, true) }.join(' ')}"
+      s = if name.to_s.start_with?(":") && fields.size == 2
+            "#{render(fields[0], true)} #{name} #{render(fields[1], true)}"
+          else
+            "#{name} #{fields.map { |f| render(f, true) }.join(' ')}"
+          end
       atomic ? "(#{s})" : s
     end
 

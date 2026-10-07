@@ -26,6 +26,12 @@ module HaskellMatch
       def constructor_info(name, scope = GLOBAL_SCOPE)
         constructor_info_in(name, scope)
       end
+
+      # Copy the user types of scope `src` (all, or those named) into `dst`;
+      # returns the names imported.
+      def import_scope(dst, src, names = nil)
+        import_scope_in(dst, src, names)
+      end
     end
   end
 

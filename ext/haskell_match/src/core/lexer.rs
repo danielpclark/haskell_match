@@ -4,6 +4,8 @@ use super::error::{CoreError, Result};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Tok {
+    /// An infix constructor operator such as `:+:` (always starts with `:`).
+    ConSym(String),
     LParen,
     RParen,
     LBracket,
@@ -171,6 +173,16 @@ pub fn tokenize(src: &str) -> Result<Vec<Token>> {
                 push(&mut out, Tok::Sym(s));
                 i = next;
             }
+            ':' if i + 1 < chars.len() && is_consym_char(chars[i + 1]) => {
+                // an infix constructor such as `:+:` or `:|`
+                let start = i;
+                i += 1;
+                while i < chars.len() && is_consym_char(chars[i]) {
+                    i += 1;
+                }
+                let sym: String = chars[start..i].iter().collect();
+                push(&mut out, Tok::ConSym(sym));
+            }
             ':' => {
                 push(&mut out, Tok::Colon);
                 i += 1;
@@ -252,6 +264,11 @@ pub fn tokenize(src: &str) -> Result<Vec<Token>> {
 /// A `:` starts a Ruby symbol literal (an extension) only when it is not
 /// directly attached to a preceding operand: `(x:xs)` and `x : xs` are cons,
 /// `:ok`, `[:a, :b]`, `Just :ok` and `(Pair :a :b)` are symbols.
+/// Characters that may follow the leading `:` of an infix constructor.
+fn is_consym_char(c: char) -> bool {
+    "!#$%&*+./<=>?@\\^|-~:".contains(c)
+}
+
 fn symbol_position(chars: &[char], i: usize) -> bool {
     if i == 0 {
         return true;

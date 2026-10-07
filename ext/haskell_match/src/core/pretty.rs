@@ -130,7 +130,11 @@ fn render(env: &TypeEnv, p: &WPat, atomic: bool, notes: &mut Vec<String>) -> Str
                     } else {
                         let inner: Vec<String> =
                             args.iter().map(|a| render(env, a, true, notes)).collect();
-                        let s = format!("{} {}", con.name, inner.join(" "));
+                        let s = if con.name.starts_with(':') && inner.len() == 2 {
+                            format!("{} {} {}", inner[0], con.name, inner[1])
+                        } else {
+                            format!("{} {}", con.name, inner.join(" "))
+                        };
                         if atomic {
                             format!("({})", s)
                         } else {
@@ -245,7 +249,11 @@ fn render_pat_inner(env: &TypeEnv, p: &Pat, names: &[String], atomic: bool) -> S
                             .iter()
                             .map(|a| render_pat_inner(env, a, names, true))
                             .collect();
-                        let s = format!("{} {}", con.name, inner.join(" "));
+                        let s = if con.name.starts_with(':') && inner.len() == 2 {
+                            format!("{} {} {}", inner[0], con.name, inner[1])
+                        } else {
+                            format!("{} {}", con.name, inner.join(" "))
+                        };
                         if atomic {
                             format!("({})", s)
                         } else {

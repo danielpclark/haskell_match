@@ -9,10 +9,15 @@ use super::lexer::{tokenize, Tok, Token};
 use crate::core::ast::{Lit, RawPat};
 use crate::core::error::{CoreError, ErrorKind, Result};
 use crate::core::parser::{ConDecl, DataDecl};
+use std::collections::HashMap;
 
 struct P {
     toks: Vec<Token>,
     i: usize,
+    /// Operator fixities declared in the module (`infixl 6 <+>`).
+    fixities: HashMap<String, (u8, Assoc)>,
+    /// Counter for generated names (`\case` parameters, tuple sections).
+    gensym: usize,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -22,7 +27,7 @@ enum Assoc {
     None,
 }
 
-fn fixity(op: &str) -> (u8, Assoc) {
+fn default_fixity(op: &str) -> (u8, Assoc) {
     match op {
         "." => (9, Assoc::Right),
         "!!" => (9, Assoc::Left),
@@ -40,6 +45,16 @@ fn fixity(op: &str) -> (u8, Assoc) {
 }
 
 impl P {
+    fn fixity(&self, op: &str) -> (u8, Assoc) {
+        self.fixities
+            .get(op)
+            .copied()
+            .unwrap_or_else(|| default_fixity(op))
+    }
+    fn fresh(&mut self, prefix: &str) -> String {
+        self.gensym += 1;
+        format!("{}__{}", prefix, self.gensym)
+    }
     fn peek(&self) -> &Tok {
         &self.toks[self.i].tok
     }
@@ -115,33 +130,92 @@ fn unqualify(name: String) -> String {
     }
 }
 
+/// Collect `infix[lr] [prec] op, op ...` declarations anywhere in the token
+/// stream: Haskell lets a fixity declaration follow the operator's uses.
+fn collect_fixities(toks: &[Token]) -> Result<HashMap<String, (u8, Assoc)>> {
+    let mut out = HashMap::new();
+    let mut i = 0;
+    while i < toks.len() {
+        let assoc = match toks[i].tok {
+            Tok::Infix => Assoc::None,
+            Tok::Infixl => Assoc::Left,
+            Tok::Infixr => Assoc::Right,
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+        let (line, col) = (toks[i].line, toks[i].col);
+        i += 1;
+        let mut prec = 9u8;
+        if let Tok::Int(n) = &toks[i].tok {
+            prec = n.parse::<u8>().ok().filter(|p| *p <= 9).ok_or_else(|| {
+                CoreError::new(
+                    ErrorKind::Syntax,
+                    format!("{}:{}: fixity precedence must be 0..9", line, col),
+                )
+            })?;
+            i += 1;
+        }
+        loop {
+            match &toks[i].tok {
+                Tok::VarSym(s) | Tok::ConSym(s) => {
+                    out.insert(s.clone(), (prec, assoc));
+                    i += 1;
+                }
+                Tok::Backtick => {
+                    if let (Tok::VarId(v), Tok::Backtick) = (&toks[i + 1].tok, &toks[i + 2].tok) {
+                        out.insert(v.clone(), (prec, assoc));
+                        i += 3;
+                    } else {
+                        return Err(CoreError::new(
+                            ErrorKind::Syntax,
+                            format!("{}:{}: malformed fixity declaration", line, col),
+                        ));
+                    }
+                }
+                t => {
+                    return Err(CoreError::new(
+                        ErrorKind::Syntax,
+                        format!(
+                            "{}:{}: expected an operator in fixity declaration but found {}",
+                            line,
+                            col,
+                            describe(t)
+                        ),
+                    ))
+                }
+            }
+            if toks[i].tok == Tok::Comma {
+                i += 1;
+            } else {
+                break;
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// Parse a module (a whole source text).
 pub fn parse_module(src: &str) -> Result<Module> {
     let toks = layout(tokenize(src)?);
-    let mut p = P { toks, i: 0 };
+    let fixities = collect_fixities(&toks)?;
+    let mut p = P {
+        toks,
+        i: 0,
+        fixities,
+        gensym: 0,
+    };
     let mut name = None;
+    let mut exports = None;
     if p.at(Tok::Module) {
         p.next();
         match p.next() {
             Tok::ConId(n) => name = Some(n),
             t => return p.err(format!("expected a module name but found {}", describe(&t))),
         }
-        // optional export list
         if p.at(Tok::LParen) {
-            let mut depth = 0;
-            loop {
-                match p.next() {
-                    Tok::LParen => depth += 1,
-                    Tok::RParen => {
-                        depth -= 1;
-                        if depth == 0 {
-                            break;
-                        }
-                    }
-                    Tok::Eof => return p.err("unterminated export list"),
-                    _ => {}
-                }
-            }
+            exports = Some(p.item_list(true)?);
         }
         p.expect(Tok::Where, "'where' after module header")?;
     }
@@ -151,6 +225,7 @@ pub fn parse_module(src: &str) -> Result<Module> {
     }
     Ok(Module {
         name,
+        exports,
         decls: group(decls, &p)?,
     })
 }
@@ -236,15 +311,139 @@ impl P {
         Ok(items)
     }
 
-    fn top_decl(&mut self) -> Result<Option<Decl>> {
-        match self.peek() {
-            Tok::Import => {
-                // import [qualified] Name [as X] [hiding] [(..)]
-                while !self.is_semi() && !self.is_close() && !self.at(Tok::Eof) {
+    /// `( item, item, ... )`: an export or import list.  Items are
+    /// variables, parenthesised operators, and type names optionally followed
+    /// by `(..)` or a constructor list; `module M` entries (exports) are
+    /// skipped.  Returns the flat list of names.
+    fn item_list(&mut self, exports: bool) -> Result<Vec<String>> {
+        self.expect(Tok::LParen, "'('")?;
+        let mut names = Vec::new();
+        loop {
+            match self.peek().clone() {
+                Tok::RParen => {
+                    self.next();
+                    break;
+                }
+                Tok::Comma => {
                     self.next();
                 }
-                Ok(None)
+                Tok::VarId(v) => {
+                    self.next();
+                    names.push(v);
+                }
+                Tok::Module if exports => {
+                    self.next();
+                    match self.next() {
+                        Tok::ConId(_) => {}
+                        t => {
+                            return self
+                                .err(format!("expected a module name but found {}", describe(&t)))
+                        }
+                    }
+                }
+                Tok::ConId(c) => {
+                    self.next();
+                    names.push(unqualify(c));
+                    if self.at(Tok::LParen) {
+                        // `(..)` or `(C1, C2)` or `(f1, f2)`
+                        self.next();
+                        loop {
+                            match self.next() {
+                                Tok::RParen => break,
+                                Tok::DotDot | Tok::Comma | Tok::ConId(_) | Tok::VarId(_) => {}
+                                Tok::LParen => {
+                                    // `((:+:))`
+                                    self.next();
+                                    self.expect(Tok::RParen, "')'")?;
+                                }
+                                t => {
+                                    return self.err(format!(
+                                        "unexpected {} in constructor list",
+                                        describe(&t)
+                                    ))
+                                }
+                            }
+                        }
+                    }
+                }
+                Tok::LParen => {
+                    self.next();
+                    match self.next() {
+                        Tok::VarSym(s) | Tok::ConSym(s) => names.push(s),
+                        t => {
+                            return self
+                                .err(format!("expected an operator but found {}", describe(&t)))
+                        }
+                    }
+                    self.expect(Tok::RParen, "')' after operator")?;
+                }
+                Tok::Type => {
+                    // `type T` (ExplicitNamespaces): take the name
+                    self.next();
+                }
+                t => return self.err(format!("unexpected {} in export/import list", describe(&t))),
             }
+        }
+        Ok(names)
+    }
+
+    /// `import [qualified] M [as A] [hiding] [(items)]`
+    fn import_decl(&mut self) -> Result<Decl> {
+        let (line, _) = self.here();
+        self.next(); // import
+        let mut qualified = false;
+        if matches!(self.peek(), Tok::VarId(v) if v == "qualified") {
+            qualified = true;
+            self.next();
+        }
+        let module = match self.next() {
+            Tok::ConId(m) => m,
+            t => return self.err(format!("expected a module name but found {}", describe(&t))),
+        };
+        // ImportQualifiedPost: `import M qualified`
+        if matches!(self.peek(), Tok::VarId(v) if v == "qualified") {
+            qualified = true;
+            self.next();
+        }
+        let mut alias = None;
+        if matches!(self.peek(), Tok::VarId(v) if v == "as") {
+            self.next();
+            match self.next() {
+                Tok::ConId(a) => alias = Some(a),
+                t => {
+                    return self.err(format!(
+                        "expected an alias after 'as' but found {}",
+                        describe(&t)
+                    ))
+                }
+            }
+        }
+        let mut hiding = false;
+        if matches!(self.peek(), Tok::VarId(v) if v == "hiding") {
+            hiding = true;
+            self.next();
+        }
+        let items = if self.at(Tok::LParen) {
+            Some(self.item_list(false)?)
+        } else {
+            None
+        };
+        if hiding && items.is_none() {
+            return self.err("'hiding' needs a list of names");
+        }
+        Ok(Decl::Import {
+            module,
+            qualified,
+            alias,
+            hiding,
+            items,
+            line,
+        })
+    }
+
+    fn top_decl(&mut self) -> Result<Option<Decl>> {
+        match self.peek() {
+            Tok::Import => self.import_decl().map(Some),
             Tok::Type | Tok::Class | Tok::Instance | Tok::Infix | Tok::Infixl | Tok::Infixr => {
                 let what = describe(self.peek());
                 if matches!(self.peek(), Tok::Class | Tok::Instance) {
@@ -359,8 +558,46 @@ impl P {
     }
 
     fn con_decl(&mut self) -> Result<ConDecl> {
+        // infix constructor `atype :op: atype`
+        let infix = match self.peek() {
+            Tok::ConId(_) => matches!(self.peek_at(1), Tok::ConSym(_)),
+            Tok::LParen if matches!(self.peek_at(1), Tok::ConSym(_)) => false,
+            _ => self.starts_atype(),
+        };
+        if infix {
+            self.atype()?;
+            let name = match self.next() {
+                Tok::ConSym(op) => op,
+                t => {
+                    return self.err(format!(
+                        "expected an infix constructor but found {}",
+                        describe(&t)
+                    ))
+                }
+            };
+            self.atype()?;
+            return Ok(ConDecl {
+                name,
+                arity: 2,
+                fields: None,
+                types: Vec::new(),
+            });
+        }
         let name = match self.next() {
             Tok::ConId(n) => unqualify(n),
+            Tok::LParen => {
+                let op = match self.next() {
+                    Tok::ConSym(op) => op,
+                    t => {
+                        return self.err(format!(
+                            "expected a constructor operator but found {}",
+                            describe(&t)
+                        ))
+                    }
+                };
+                self.expect(Tok::RParen, "')' after constructor operator")?;
+                op
+            }
             t => {
                 return self.err(format!(
                     "expected a constructor name but found {}",
@@ -494,9 +731,55 @@ impl P {
         }
     }
 
+    /// `(op)` at the current position: the operator's name.
+    fn paren_op(&self) -> Option<String> {
+        if self.at(Tok::LParen) && self.peek_at(2) == &Tok::RParen {
+            if let Tok::VarSym(s) | Tok::ConSym(s) = self.peek_at(1) {
+                return Some(s.clone());
+            }
+        }
+        None
+    }
+
     /// A declaration inside any block: signature, equation or pattern binding.
     fn decl(&mut self) -> Result<Decl> {
         let (line, _) = self.here();
+        // operator in prefix form: `(<+>) :: ...` or `(<+>) a b = ...`
+        if let Some(op) = self.paren_op() {
+            self.next();
+            self.next();
+            self.next();
+            if self.at(Tok::DoubleColon) {
+                self.next();
+                let arity = self.skip_type_until(&[])?;
+                return Ok(Decl::Sig {
+                    names: vec![op],
+                    arity,
+                    line,
+                });
+            }
+            let mut pats = Vec::new();
+            while self.starts_apat() {
+                pats.push(self.apat()?);
+            }
+            let (rhs, wheres) = self.rhs(Tok::Equals)?;
+            if pats.is_empty() {
+                // `(<+>) = someFunction`: a value of function type
+                return Ok(Decl::PatBind {
+                    pat: RawPat::Var(op),
+                    rhs,
+                    wheres,
+                    line,
+                });
+            }
+            return Ok(Decl::Fun(vec![Equation {
+                name: op,
+                pats,
+                rhs,
+                wheres,
+                line,
+            }]));
+        }
         // signature: var (, var)* :: type
         if let Tok::VarId(_) = self.peek() {
             let mut j = 1;
@@ -539,12 +822,12 @@ impl P {
                 while self.starts_apat() {
                     pats.push(self.apat()?);
                 }
-                if let Tok::VarSym(op) | Tok::ConSym(op) = self.peek().clone() {
-                    if !matches!(op.as_str(), "=") {
-                        // infix definition with a left operand pattern: (x `op` y) handled below
-                        return self
-                            .err(format!("operator definitions ('{}') are not supported", op));
-                    }
+                if let Tok::VarSym(_) | Tok::Backtick = self.peek() {
+                    // `f x <+> y = ...` is really an infix definition of `<+>`
+                    // whose left operand is the pattern `f x`: not valid Haskell
+                    return self.err(
+                        "a function application cannot be the left operand of an operator definition",
+                    );
                 }
                 let (rhs, wheres) = self.rhs(Tok::Equals)?;
                 return Ok(Decl::Fun(vec![Equation {
@@ -556,13 +839,39 @@ impl P {
                 }]));
             }
         }
-        // pattern binding: pat = e
+        // pattern binding `pat = e`, or an infix definition `pat op pat = e`
         let pat = self.pattern()?;
-        if let Tok::VarSym(op) = self.peek().clone() {
-            return self.err(format!("operator definitions ('{}') are not supported", op));
-        }
-        if self.at(Tok::Backtick) {
-            return self.err("infix function definitions are not supported; write `f x y = ...`");
+        let infix_name = match self.peek().clone() {
+            Tok::VarSym(op) => {
+                self.next();
+                Some(op)
+            }
+            Tok::Backtick => {
+                self.next();
+                let name = match self.next() {
+                    Tok::VarId(v) => v,
+                    t => {
+                        return self.err(format!(
+                            "expected a function name in backticks but found {}",
+                            describe(&t)
+                        ))
+                    }
+                };
+                self.expect(Tok::Backtick, "closing backtick")?;
+                Some(name)
+            }
+            _ => None,
+        };
+        if let Some(name) = infix_name {
+            let right = self.pattern()?;
+            let (rhs, wheres) = self.rhs(Tok::Equals)?;
+            return Ok(Decl::Fun(vec![Equation {
+                name,
+                pats: vec![pat, right],
+                rhs,
+                wheres,
+                line,
+            }]));
         }
         let (rhs, wheres) = self.rhs(Tok::Equals)?;
         Ok(Decl::PatBind {
@@ -580,10 +889,10 @@ impl P {
             let mut guards = Vec::new();
             while self.at(Tok::Pipe) {
                 self.next();
-                let g = self.expr()?;
+                let quals = self.quals()?;
                 self.expect(sep.clone(), if sep == Tok::Equals { "'='" } else { "'->'" })?;
                 let e = self.expr()?;
-                guards.push((g, e));
+                guards.push((quals, e));
             }
             Rhs::Guarded(guards)
         } else {
@@ -622,15 +931,16 @@ impl P {
         )
     }
 
-    /// pattern := lpat (':' pattern)?
+    /// pattern := lpat (consym pattern)?
     fn pattern(&mut self) -> Result<RawPat> {
         let head = self.lpat()?;
-        if let Tok::ConSym(s) = self.peek() {
+        if let Tok::ConSym(s) = self.peek().clone() {
+            self.next();
+            let tail = self.pattern()?;
             if s == ":" {
-                self.next();
-                let tail = self.pattern()?;
                 return Ok(RawPat::Cons(Box::new(head), Box::new(tail)));
             }
+            return Ok(RawPat::Con(s, vec![head, tail]));
         }
         Ok(head)
     }
@@ -639,6 +949,22 @@ impl P {
         match self.peek().clone() {
             Tok::ConId(name) if !matches!(self.peek_at(1), Tok::LBrace) => {
                 let name = unqualify(name);
+                self.next();
+                let mut args = Vec::new();
+                while self.starts_apat() {
+                    args.push(self.apat()?);
+                }
+                Ok(RawPat::Con(name, args))
+            }
+            // prefix use of an infix constructor: `(:+:) a b`
+            Tok::LParen
+                if matches!(self.peek_at(1), Tok::ConSym(_)) && self.peek_at(2) == &Tok::RParen =>
+            {
+                self.next();
+                let name = match self.next() {
+                    Tok::ConSym(op) => op,
+                    _ => unreachable!(),
+                };
                 self.next();
                 let mut args = Vec::new();
                 while self.starts_apat() {
@@ -836,7 +1162,11 @@ impl P {
             self.lexp()?
         };
         while let Some((op, width)) = self.peek_op() {
-            let (prec, assoc) = fixity(&op);
+            // `(e op)`: the operator belongs to a left section, not to us
+            if self.peek_at(width) == &Tok::RParen {
+                break;
+            }
+            let (prec, assoc) = self.fixity(&op);
             if prec < min_prec {
                 break;
             }
@@ -856,6 +1186,20 @@ impl P {
 
     fn lexp(&mut self) -> Result<Expr> {
         match self.peek() {
+            Tok::Backslash if self.peek_at(1) == &Tok::Case => {
+                // LambdaCase: `\case alts` == `\x -> case x of alts`
+                self.next();
+                self.next();
+                let alts = self.block(|p| p.alt().map(Some))?;
+                if alts.is_empty() {
+                    return self.err("\\case needs at least one alternative");
+                }
+                let v = self.fresh("lc");
+                Ok(Expr::Lambda(
+                    vec![RawPat::Var(v.clone())],
+                    Box::new(Expr::Case(Box::new(Expr::Var(v)), alts)),
+                ))
+            }
             Tok::Backslash => {
                 self.next();
                 let mut pats = Vec::new();
@@ -876,6 +1220,22 @@ impl P {
                 self.expect(Tok::In, "'in' after let bindings")?;
                 let body = self.expr()?;
                 Ok(Expr::Let(decls, Box::new(body)))
+            }
+            Tok::If if self.peek_at(1) == &Tok::Pipe => {
+                // MultiWayIf: `if | quals -> e | quals -> e ...`
+                self.next();
+                let mut arms = Vec::new();
+                while self.at(Tok::Pipe) {
+                    self.next();
+                    let quals = self.quals()?;
+                    self.expect(Tok::RArrow, "'->' in multi-way if")?;
+                    let e = self.expr()?;
+                    arms.push((quals, e));
+                    while self.is_semi() && self.peek_at(1) == &Tok::Pipe {
+                        self.next();
+                    }
+                }
+                Ok(Expr::MultiIf(arms))
             }
             Tok::If => {
                 self.next();
@@ -907,6 +1267,20 @@ impl P {
         }
     }
 
+    /// Comma-separated qualifiers (guards, `pat <- e`, `let`).
+    fn quals(&mut self) -> Result<Vec<Qual>> {
+        let mut quals = Vec::new();
+        loop {
+            quals.push(self.qual()?);
+            if self.at(Tok::Comma) {
+                self.next();
+            } else {
+                break;
+            }
+        }
+        Ok(quals)
+    }
+
     fn alt(&mut self) -> Result<Alt> {
         let (line, _) = self.here();
         let pat = self.pattern()?;
@@ -935,16 +1309,61 @@ impl P {
 
     /// Function application: `aexp aexp*`.
     fn fexp(&mut self) -> Result<Expr> {
-        let f = self.aexp()?;
+        let f = self.aexp_record()?;
         let mut args = Vec::new();
         while self.starts_aexp() {
-            args.push(self.aexp()?);
+            args.push(self.aexp_record()?);
         }
         if args.is_empty() {
             Ok(f)
         } else {
             Ok(Expr::App(Box::new(f), args))
         }
+    }
+
+    /// An atomic expression optionally followed by record braces:
+    /// `Con { f = e }` constructs, `e { f = e }` updates.
+    fn aexp_record(&mut self) -> Result<Expr> {
+        let mut e = self.aexp()?;
+        while self.at(Tok::LBrace) {
+            self.next();
+            let mut fields = Vec::new();
+            if !self.at(Tok::RBrace) {
+                loop {
+                    let f = match self.next() {
+                        Tok::VarId(f) => f,
+                        t => {
+                            return self
+                                .err(format!("expected a field name but found {}", describe(&t)))
+                        }
+                    };
+                    let v = if self.at(Tok::Equals) {
+                        self.next();
+                        self.expr()?
+                    } else {
+                        Expr::Var(f.clone()) // NamedFieldPuns
+                    };
+                    fields.push((f, v));
+                    match self.next() {
+                        Tok::Comma => {}
+                        Tok::RBrace => break,
+                        t => {
+                            return self.err(format!(
+                                "expected ',' or '}}' in record syntax but found {}",
+                                describe(&t)
+                            ))
+                        }
+                    }
+                }
+            } else {
+                self.next();
+            }
+            e = match e {
+                Expr::Con(c) => Expr::RecCon(c, fields),
+                other => Expr::RecUpdate(Box::new(other), fields),
+            };
+        }
+        Ok(e)
     }
 
     fn aexp(&mut self) -> Result<Expr> {
@@ -983,11 +1402,15 @@ impl P {
                 for _ in 0..width {
                     self.next();
                 }
-                let (prec, _) = fixity(&op);
+                let (prec, _) = self.fixity(&op);
                 let e = self.infix_expr(prec)?;
                 self.expect(Tok::RParen, "')' to close section")?;
                 return Ok(Expr::SectionR(op, Box::new(e)));
             }
+        }
+        // TupleSections: `(,x)`, `(x,)`, `(,,)` ...
+        if self.at(Tok::Comma) {
+            return self.tuple_section(None);
         }
         let first = self.expr()?;
         // left section (e op)
@@ -1001,16 +1424,42 @@ impl P {
             }
         }
         if self.at(Tok::Comma) {
-            let mut items = vec![first];
-            while self.at(Tok::Comma) {
-                self.next();
-                items.push(self.expr()?);
-            }
-            self.expect(Tok::RParen, "')' to close tuple")?;
-            return Ok(Expr::Tuple(items));
+            return self.tuple_section(Some(first));
         }
         self.expect(Tok::RParen, "')'")?;
         Ok(first)
+    }
+
+    /// The rest of a tuple after its first slot (`first`, or `None` when the
+    /// first slot is empty).  Empty slots make the tuple a function of the
+    /// missing components (TupleSections); with no empty slot it is a tuple.
+    fn tuple_section(&mut self, first: Option<Expr>) -> Result<Expr> {
+        let mut slots: Vec<Option<Expr>> = vec![first];
+        while self.at(Tok::Comma) {
+            self.next();
+            if self.at(Tok::Comma) || self.at(Tok::RParen) {
+                slots.push(None);
+            } else {
+                slots.push(Some(self.expr()?));
+            }
+        }
+        self.expect(Tok::RParen, "')' to close tuple")?;
+        if slots.iter().all(|s| s.is_some()) {
+            return Ok(Expr::Tuple(slots.into_iter().map(|s| s.unwrap()).collect()));
+        }
+        let mut params = Vec::new();
+        let items = slots
+            .into_iter()
+            .map(|s| match s {
+                Some(e) => e,
+                None => {
+                    let v = self.fresh("ts");
+                    params.push(RawPat::Var(v.clone()));
+                    Expr::Var(v)
+                }
+            })
+            .collect();
+        Ok(Expr::Lambda(params, Box::new(Expr::Tuple(items))))
     }
 
     /// After `[`: list, range or comprehension.
@@ -1246,12 +1695,251 @@ mod tests {
     fn errors() {
         assert!(parse_module("f x = ").is_err());
         assert!(parse_module("f x = case x of").is_err());
-        assert!(parse_module("x <+> y = 1").is_err());
         assert!(parse_module("class Foo a where\n  foo :: a").is_err());
         assert!(parse_module("f = do\n  x").is_err());
         assert!(parse_module("f 0 = 1\nf x y = 2").is_err());
         assert!(parse_module("f 0 = 1\ng = 2\nf x = 3").is_err());
         let e = parse_module("f = (1 +").unwrap_err();
         assert!(e.message.starts_with("1:"), "{}", e.message);
+    }
+
+    #[test]
+    fn operators_fixities_and_infix_definitions() {
+        let m = parse(
+            "infixl 6 <+>\n\
+             infixr 5 `cons'`\n\
+             (<+>) :: Int -> Int -> Int\n\
+             a <+> b = a + b * 2\n\
+             (<->) a b = a - b\n\
+             x `cons'` xs = x : xs\n\
+             f = 1 <+> 2 <+> 3 <-> 4\n\
+             g = 1 `cons'` 2 `cons'` []\n",
+        );
+        assert_eq!(fun(&m, "<+>")[0].pats.len(), 2);
+        assert_eq!(fun(&m, "<->")[0].pats.len(), 2);
+        assert_eq!(fun(&m, "cons'")[0].pats.len(), 2);
+        // `<+>` is infixl 6 (binds tighter than the default-9 `<->`? no: `<->`
+        // defaults to infixl 9, so `3 <-> 4` groups first)
+        let f = m.decls.iter().find_map(|d| match d {
+            Decl::PatBind {
+                pat: RawPat::Var(n),
+                rhs: Rhs::Plain(e),
+                ..
+            } if n == "f" => Some(e.clone()),
+            _ => None,
+        });
+        match f.unwrap() {
+            Expr::BinOp(op, l, r) => {
+                assert_eq!(op, "<+>");
+                assert!(matches!(*l, Expr::BinOp(ref o, ..) if o == "<+>"));
+                assert!(matches!(*r, Expr::BinOp(ref o, ..) if o == "<->"));
+            }
+            other => panic!("unexpected {:?}", other),
+        }
+        // infixr: `1 `cons'` (2 `cons'` [])`
+        let g = m.decls.iter().find_map(|d| match d {
+            Decl::PatBind {
+                pat: RawPat::Var(n),
+                rhs: Rhs::Plain(e),
+                ..
+            } if n == "g" => Some(e.clone()),
+            _ => None,
+        });
+        match g.unwrap() {
+            Expr::BinOp(op, _, r) => {
+                assert_eq!(op, "cons'");
+                assert!(matches!(*r, Expr::BinOp(ref o, ..) if o == "cons'"));
+            }
+            other => panic!("unexpected {:?}", other),
+        }
+        assert!(parse_module("infixl 10 <+>\nf = 1").is_err());
+        assert!(parse_module("f x <+> y = 1").is_err());
+    }
+
+    #[test]
+    fn infix_constructors() {
+        let m = parse(
+            "data C = Double :+: Double | (:*:) Int Int\nre (a :+: _) = a\nmk a b = a :+: b\n",
+        );
+        match &m.decls[0] {
+            Decl::Data { decl, .. } => {
+                assert_eq!(decl.cons[0].name, ":+:");
+                assert_eq!(decl.cons[0].arity, 2);
+                assert_eq!(decl.cons[1].name, ":*:");
+            }
+            other => panic!("unexpected {:?}", other),
+        }
+        assert_eq!(render_pat(&fun(&m, "re")[0].pats[0]), "(hs_a :+: _)");
+        assert!(matches!(&fun(&m, "mk")[0].rhs, Rhs::Plain(Expr::BinOp(op, ..)) if op == ":+:"));
+    }
+
+    #[test]
+    fn pattern_guards_multiway_if_lambda_case_tuple_sections() {
+        let m = parse(
+            "f m k\n  | Just v <- lookup k m, v > 0 = v\n  | let w = k * 2, w > 10 = w\n  | otherwise = 0\n\
+             g x = if | x < 0 -> \"neg\"\n         | x == 0 -> \"zero\"\n         | otherwise -> \"pos\"\n\
+             h = \\case\n  0 -> \"z\"\n  _ -> \"nz\"\n\
+             p = (,1)\n\
+             q = (1,,3)\n",
+        );
+        match &fun(&m, "f")[0].rhs {
+            Rhs::Guarded(arms) => {
+                assert_eq!(arms.len(), 3);
+                assert!(matches!(&arms[0].0[0], Qual::Gen(RawPat::Con(c, _), _) if c == "Just"));
+                assert!(matches!(&arms[0].0[1], Qual::Guard(_)));
+                assert!(matches!(&arms[1].0[0], Qual::Let(_)));
+            }
+            other => panic!("unexpected {:?}", other),
+        }
+        assert!(matches!(&fun(&m, "g")[0].rhs, Rhs::Plain(Expr::MultiIf(arms)) if arms.len() == 3));
+        let h = m
+            .decls
+            .iter()
+            .find_map(|d| match d {
+                Decl::PatBind {
+                    pat: RawPat::Var(n),
+                    rhs: Rhs::Plain(e),
+                    ..
+                } if n == "h" => Some(e.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert!(
+            matches!(h, Expr::Lambda(ref ps, ref body) if ps.len() == 1 && matches!(**body, Expr::Case(..)))
+        );
+        let p = m
+            .decls
+            .iter()
+            .find_map(|d| match d {
+                Decl::PatBind {
+                    pat: RawPat::Var(n),
+                    rhs: Rhs::Plain(e),
+                    ..
+                } if n == "p" => Some(e.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert!(
+            matches!(p, Expr::Lambda(ref ps, ref body) if ps.len() == 1 && matches!(**body, Expr::Tuple(ref items) if items.len() == 2))
+        );
+        let q = m
+            .decls
+            .iter()
+            .find_map(|d| match d {
+                Decl::PatBind {
+                    pat: RawPat::Var(n),
+                    rhs: Rhs::Plain(e),
+                    ..
+                } if n == "q" => Some(e.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert!(matches!(q, Expr::Lambda(ref ps, _) if ps.len() == 1));
+    }
+
+    #[test]
+    fn left_and_right_sections() {
+        let m = parse("f = map (3 <+>) xs\ng = map (<+> 3) xs\nh = (1 + 2 <+>)\n");
+        let body = |n: &str| {
+            m.decls
+                .iter()
+                .find_map(|d| match d {
+                    Decl::PatBind {
+                        pat: RawPat::Var(v),
+                        rhs: Rhs::Plain(e),
+                        ..
+                    } if v == n => Some(e.clone()),
+                    _ => None,
+                })
+                .unwrap()
+        };
+        assert!(
+            matches!(body("f"), Expr::App(_, args) if matches!(&args[0], Expr::SectionL(op, _) if op == "<+>"))
+        );
+        assert!(
+            matches!(body("g"), Expr::App(_, args) if matches!(&args[0], Expr::SectionR(op, _) if op == "<+>"))
+        );
+        assert!(
+            matches!(body("h"), Expr::SectionL(op, inner) if op == "<+>" && matches!(*inner, Expr::BinOp(..)))
+        );
+    }
+
+    #[test]
+    fn record_construction_and_update() {
+        let m = parse("mk = P { nm = \"a\", yrs = 1 }\nolder p = p { yrs = yrs p + 1 }\npun nm = P { nm, yrs = 0 }\n");
+        let body = |n: &str| {
+            m.decls
+                .iter()
+                .find_map(|d| match d {
+                    Decl::PatBind {
+                        pat: RawPat::Var(v),
+                        rhs: Rhs::Plain(e),
+                        ..
+                    } if v == n => Some(e.clone()),
+                    Decl::Fun(eqs) if eqs[0].name == n => match &eqs[0].rhs {
+                        Rhs::Plain(e) => Some(e.clone()),
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .unwrap()
+        };
+        assert!(matches!(body("mk"), Expr::RecCon(c, fs) if c == "P" && fs.len() == 2));
+        assert!(
+            matches!(body("older"), Expr::RecUpdate(_, fs) if fs.len() == 1 && fs[0].0 == "yrs")
+        );
+        assert!(
+            matches!(body("pun"), Expr::RecCon(_, fs) if matches!(&fs[0].1, Expr::Var(v) if v == "nm"))
+        );
+    }
+
+    #[test]
+    fn imports_and_exports() {
+        let m = parse(
+            "module M (f, (<+>), T(..), module X) where\n\
+             import Data.List (sortBy, (\\\\))\n\
+             import qualified Data.Map as Map hiding (foldr)\n\
+             import Geometry\n\
+             f = 1\n",
+        );
+        assert_eq!(
+            m.exports,
+            Some(vec!["f".to_string(), "<+>".to_string(), "T".to_string()])
+        );
+        match &m.decls[0] {
+            Decl::Import {
+                module,
+                items,
+                qualified,
+                ..
+            } => {
+                assert_eq!(module, "Data.List");
+                assert_eq!(
+                    items.as_ref().unwrap(),
+                    &vec!["sortBy".to_string(), "\\\\".to_string()]
+                );
+                assert!(!qualified);
+            }
+            other => panic!("unexpected {:?}", other),
+        }
+        match &m.decls[1] {
+            Decl::Import {
+                module,
+                alias,
+                qualified,
+                hiding,
+                items,
+                ..
+            } => {
+                assert_eq!(module, "Data.Map");
+                assert_eq!(alias.as_deref(), Some("Map"));
+                assert!(*qualified && *hiding);
+                assert_eq!(items.as_ref().unwrap(), &vec!["foldr".to_string()]);
+            }
+            other => panic!("unexpected {:?}", other),
+        }
+        assert!(
+            matches!(&m.decls[2], Decl::Import { module, items: None, .. } if module == "Geometry")
+        );
     }
 }
