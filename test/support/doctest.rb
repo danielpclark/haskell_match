@@ -9,8 +9,14 @@ src = File.read(ARGV[0])
 src = src[0, src.index("## Installation")] if src.include?("## Installation")
 blocks = src.scan(/```ruby\n(.*?)```/m).flatten
 $failures = 0
+# Ruby 3.4 inspects Hashes as `{x: 9}` where earlier versions print
+# `{:x=>9}`; the README uses the new form and both are read alike.
+def __normalize(inspected)
+  inspected.gsub(/:(\w+[?!]?)=>/, '\1: ')
+end
+
 def __check(actual, expected, where)
-  return if actual.inspect == expected
+  return if __normalize(actual.inspect) == __normalize(expected)
   puts "#{where}: expected #{expected}, got #{actual.inspect}"
   $failures += 1
 end
