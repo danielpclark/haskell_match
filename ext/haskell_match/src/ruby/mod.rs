@@ -1,45 +1,50 @@
-//! Ruby-facing API: the `HaskellMatch::Native` module and
-//! `HaskellMatch::Native::Matcher` class.
+//! Ruby-facing API: the `HaskellMatch::Native` module (`native`, declared
+//! with `#[rubymodule]`), the exceptions it raises (`error`, declared with
+//! `#[rubyerror]`) and the `HaskellMatch::Native::Matcher` class defined
+//! here.
 //!
-//! Matcher methods are defined as raw `extern "C"` functions (argc/argv
-//! style) rather than through Rutie's `methods!` macro so that the hot path
+//! `Matcher` keeps a hand-written typed-data definition rather than
+//! `#[rubyclass]`: it sets `RUBY_TYPED_FROZEN_SHAREABLE`, which a frozen
+//! matcher (and the `Function` objects built on it) needs to pass
+//! `Ractor.make_shareable`, and the derive data type has no way to add that
+//! flag.  Its hot-path methods (`call`, `prepare`, `select`, `select_with`,
+//! `run`) are raw `extern "C"` functions (argc/argv style) so that a call
 //! allocates nothing on the Rust side and clause bodies are invoked from a
 //! frame that owns no values needing `Drop` (a body may leave by exception,
-//! `throw`, `break` or `return`).
+//! `throw`, `break` or `return`).  The remaining methods go through
+//! `methods!` and return `Result`s, raised once their values are dropped.
 
+pub mod error;
+pub mod native;
 pub mod runtime;
+pub mod state;
 
 use std::ffi::CString;
 use std::os::raw::c_int;
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{LazyLock, OnceLock};
 
+use rutie::derive::IntoException;
 use rutie::rubysys::typed_data::{RUBY_TYPED_FREE_IMMEDIATELY, RUBY_TYPED_FROZEN_SHAREABLE};
 use rutie::rubysys::{array, class as rclass, rstruct, value::ValueType};
 use rutie::typed_data::DataTypeWrapper;
 use rutie::types::{CallbackPtr, DataType, DataTypeFunction, Id, Value};
 use rutie::{
-    AnyException, AnyObject, Array, Boolean, Class, Exception, Integer, Module, NilClass, Object,
-    RString, VM,
+    AnyException, AnyObject, Array, Boolean, Class, Exception, Integer, Module, Object, RString, VM,
 };
 
 use crate::core::error::{CoreError, ErrorKind};
 use crate::core::exhaust;
-use crate::core::parser::{parse_data, parse_pattern};
-use crate::core::pretty::{render_pat, render_witness};
+use crate::core::parser::parse_pattern;
+use crate::core::pretty::render_witness;
 use crate::core::resolve::resolve_clause;
 use crate::core::tree;
 use crate::core::typecheck;
-use crate::core::types::{ConSpec, TypeEnv};
+use crate::core::types::TypeEnv;
+use error::{argument_error, HmError};
 use runtime::{Bound, Matcher, RtError, STACK_BINDS};
 
-lazy_static! {
-    /// Type scopes: index 0 is the global registry; every other scope is a
-    /// snapshot of the global one at its creation plus its own declarations
-    /// (a compiled Haskell module gets one, like a Haskell module namespace).
-    static ref SCOPES: Mutex<Vec<TypeEnv>> = Mutex::new(vec![TypeEnv::new()]);
-    static ref MATCHER_TYPE: MatcherType = MatcherType::new();
-}
+static MATCHER_TYPE: LazyLock<MatcherType> = LazyLock::new(MatcherType::new);
 
 /// Interned ivar names read on every call.
 struct Ids {
@@ -55,7 +60,7 @@ static TAIL_CALL: OnceLock<usize> = OnceLock::new();
 
 fn tail_call_class() -> usize {
     *TAIL_CALL.get_or_init(|| {
-        let k = hm_class("TailCall");
+        let k = Module::from_existing("HaskellMatch").get_nested_class("TailCall");
         unsafe { rutie::rubysys::gc::rb_gc_register_mark_object(k.value()) };
         k.value().value
     })
@@ -79,26 +84,6 @@ extern "C" {
     fn rb_fiber_resume(fiber: Value, argc: c_int, argv: *const Value) -> Value;
 }
 
-thread_local! {
-    /// Nesting depth of native calls on this thread.
-    static DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
-/// Every this many nested native calls, the next clause body runs in a fresh
-/// Fiber.  Each Fiber brings its own VM stack and machine stack, so chained
-/// segments make the recursion depth a matter of memory rather than of
-/// Ruby's fixed stack size.  0 disables segmentation.
-static STACK_SEGMENT: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(DEFAULT_STACK_SEGMENT);
-const DEFAULT_STACK_SEGMENT: usize = 100;
-
-/// Maximum nesting depth of native calls before `StackOverflowError` is
-/// raised, so a runaway recursion fails instead of consuming all memory
-/// (GHC has the same kind of limit).  0 means unlimited.
-static MAX_DEPTH: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(DEFAULT_MAX_DEPTH);
-const DEFAULT_MAX_DEPTH: usize = 250_000;
-
 rutie_callback! {
     /// Body of a stack-segment Fiber: `data` is `[body, values]`.
     fn segment_fiber_body(
@@ -116,24 +101,20 @@ rutie_callback! {
     }
 }
 
-/// Invoke a clause body, either directly or (every `STACK_SEGMENT` levels)
+/// Invoke a clause body, either directly or (every `stack_segment` levels)
 /// in a fresh Fiber.  Exceptions and non-local jumps are returned as the
 /// `rb_protect` state for the caller to resume once it has cleaned up.
+///
+/// # Safety
+/// Must run on a Ruby thread holding the GVL with no Rust values needing
+/// `Drop` live in the caller (a `StackOverflowError` is raised from here).
 unsafe fn invoke_body(body: Value, bound: &Bound, buf: &[Value]) -> Result<Value, i32> {
-    let segment = STACK_SEGMENT.load(std::sync::atomic::Ordering::Relaxed);
-    let depth = DEPTH.with(|d| d.get());
-    let max = MAX_DEPTH.load(std::sync::atomic::Ordering::Relaxed);
-    if max > 0 && depth >= max {
-        VM::raise_ex(exception(
-            "StackOverflowError",
-            &format!(
-                "recursion deeper than HaskellMatch.max_depth ({}); use tail calls, defer, or raise the limit",
-                max
-            ),
-        ));
-    }
-    DEPTH.with(|d| d.set(depth + 1));
-    let result = if segment > 0 && (depth + 1).is_multiple_of(segment) {
+    let depth = match state::depth_push() {
+        Ok(depth) => depth,
+        Err(e) => raise(e),
+    };
+    let segment = state::stack_segment();
+    let result = if segment > 0 && depth.is_multiple_of(segment) {
         let vals = runtime::bound_to_array(bound, buf);
         let pair = [body, vals];
         let data = array::rb_ary_new_from_values(2, pair.as_ptr());
@@ -145,13 +126,14 @@ unsafe fn invoke_body(body: Value, bound: &Bound, buf: &[Value]) -> Result<Value
     } else {
         runtime::call_protected(|| runtime::invoke(body, bound, buf))
     };
-    DEPTH.with(|d| d.set(depth));
+    state::set_depth(depth - 1);
     result
 }
 
 /// Typed-data definition for `Matcher`.  Unlike Rutie's `wrappable_struct!`
-/// it sets `RUBY_TYPED_FROZEN_SHAREABLE`, so a frozen matcher (and the
-/// `Function` objects built on it) can be passed to `Ractor.make_shareable`.
+/// and `#[rubyclass]` it sets `RUBY_TYPED_FROZEN_SHAREABLE`, so a frozen
+/// matcher (and the `Function` objects built on it) can be passed to
+/// `Ractor.make_shareable`.
 pub struct MatcherType {
     data_type: DataType,
 }
@@ -185,60 +167,21 @@ impl DataTypeWrapper<Matcher> for MatcherType {
     }
 }
 
-class!(RMatcher);
-module!(Native);
+class!(RMatcher, "HaskellMatch::Native::Matcher");
 
 // ---------------------------------------------------------------------------
-// error helpers
+// error helpers for the raw methods
 // ---------------------------------------------------------------------------
 
-fn hm_class(name: &str) -> Class {
-    Module::from_existing("HaskellMatch").get_nested_class(name)
-}
-
-fn exception(class_name: &str, message: &str) -> AnyException {
-    AnyException::from_class(&hm_class(class_name), message)
-}
-
-/// A scope id argument (raises ArgumentError when malformed).
-fn scope_arg(scope: Result<Integer, rutie::AnyException>) -> usize {
-    let n = scope
-        .unwrap_or_else(|_| raise_arg("scope must be an Integer"))
-        .to_i64();
-    if n < 0 {
-        raise_arg("scope must not be negative");
-    }
-    n as usize
-}
-
-/// The type environment of scope `id`.
-fn scope_env(scopes: &mut [TypeEnv], id: usize) -> Result<&mut TypeEnv, String> {
-    scopes
-        .get_mut(id)
-        .ok_or_else(|| format!("unknown type scope {}", id))
-}
-
-fn error_class(kind: ErrorKind) -> &'static str {
-    match kind {
-        ErrorKind::Syntax => "PatternSyntaxError",
-        ErrorKind::UnknownConstructor => "UnknownConstructorError",
-        ErrorKind::Arity => "ArityError",
-        ErrorKind::Type => "PatternTypeError",
-        ErrorKind::DuplicateVariable => "DuplicateVariableError",
-        ErrorKind::Field => "FieldError",
-        ErrorKind::DataDeclaration => "DataDeclarationError",
-        ErrorKind::ClauseArity => "ClauseArityError",
-    }
-}
-
-fn raise_core(e: CoreError) -> ! {
-    VM::raise_ex(exception(error_class(e.kind), &e.message));
+/// Raise `e` from a raw method.  Callers hold no Rust values needing `Drop`
+/// at this point: `VM::raise_ex` `longjmp`s past the frame.
+fn raise(e: impl IntoException) -> ! {
+    VM::raise_ex(e.into_exception());
     unreachable!()
 }
 
 fn raise_arg(msg: &str) -> ! {
-    VM::raise_ex(AnyException::new("ArgumentError", Some(msg)));
-    unreachable!()
+    raise(argument_error(msg))
 }
 
 fn inspect(v: Value) -> String {
@@ -254,41 +197,33 @@ fn class_name(v: Value) -> String {
         .unwrap_or_else(|| "?".into())
 }
 
+/// Report a failed match from a raw method: a `HaskellMatch` exception, an
+/// `ArgumentError`, or the resumption of a pending Ruby exception or jump.
 fn raise_rt(name: &str, e: RtError) -> ! {
     match e {
         RtError::Ruby(state) => unsafe { rb_jump_tag(state) },
-        RtError::NoMatch => VM::raise_ex(exception(
-            "MatchError",
-            &format!("Non-exhaustive patterns in {}", name),
-        )),
-        RtError::TypeMismatch { expected, got } => VM::raise_ex(exception(
-            "TypeMismatchError",
-            &format!(
-                "{}: expected a value of type {} but got {} ({})",
-                name,
-                expected,
-                inspect(got),
-                class_name(got)
-            ),
-        )),
-        RtError::LazyFailed { clause, got } => VM::raise_ex(exception(
-            "IrrefutablePatternError",
-            &format!(
-                "{}: irrefutable pattern failed for clause {}: {} does not match",
-                name,
-                clause + 1,
-                inspect(got)
-            ),
-        )),
-        RtError::Arity { expected, got } => VM::raise_ex(AnyException::new(
-            "ArgumentError",
-            Some(&format!(
-                "wrong number of arguments (given {}, expected {})",
-                got, expected
-            )),
+        RtError::NoMatch => raise(HmError::NoMatch(format!(
+            "Non-exhaustive patterns in {}",
+            name
+        ))),
+        RtError::TypeMismatch { expected, got } => raise(HmError::TypeMismatch(format!(
+            "{}: expected a value of type {} but got {} ({})",
+            name,
+            expected,
+            inspect(got),
+            class_name(got)
+        ))),
+        RtError::LazyFailed { clause, got } => raise(HmError::IrrefutablePattern(format!(
+            "{}: irrefutable pattern failed for clause {}: {} does not match",
+            name,
+            clause + 1,
+            inspect(got)
+        ))),
+        RtError::Arity { expected, got } => raise_arg(&format!(
+            "wrong number of arguments (given {}, expected {})",
+            got, expected
         )),
     }
-    unreachable!()
 }
 
 fn raise_panic(payload: Box<dyn std::any::Any + Send>) -> ! {
@@ -300,22 +235,10 @@ fn raise_panic(payload: Box<dyn std::any::Any + Send>) -> ! {
         "unknown panic".to_string()
     };
     drop(payload);
-    VM::raise_ex(AnyException::new(
+    raise(AnyException::new(
         "RuntimeError",
         Some(&format!("haskell_match internal error: {}", msg)),
-    ));
-    unreachable!()
-}
-
-fn str_arg(v: &AnyObject, what: &str) -> Result<String, String> {
-    v.try_convert_to::<RString>()
-        .map(|s| s.to_string())
-        .map_err(|_| format!("{} must be a String, got {}", what, inspect(v.value())))
-}
-
-fn array_arg(v: &AnyObject, what: &str) -> Result<Array, String> {
-    v.try_convert_to::<Array>()
-        .map_err(|_| format!("{} must be an Array, got {}", what, inspect(v.value())))
+    ))
 }
 
 fn rstrings(items: &[String]) -> Array {
@@ -325,247 +248,6 @@ fn rstrings(items: &[String]) -> Array {
     }
     a
 }
-
-// ---------------------------------------------------------------------------
-// module functions
-// ---------------------------------------------------------------------------
-
-methods!(
-    Native,
-    _rtself,
-    // parse_data(decl) -> [name, tyvars, [[con, arity, fields_or_nil, types], ...], deriving]
-    fn native_parse_data(decl: RString) -> Array {
-        let decl = decl.unwrap_or_else(|_| raise_arg("data declaration must be a String"));
-        let d = parse_data(&decl.to_string()).unwrap_or_else(|e| raise_core(e));
-        let mut cons = Array::with_capacity(d.cons.len());
-        for c in &d.cons {
-            let mut row = Array::with_capacity(4);
-            row.push(RString::new_utf8(&c.name));
-            row.push(Integer::new(c.arity as i64));
-            match &c.fields {
-                Some(fs) => row.push(rstrings(fs).to_any_object()),
-                None => row.push(NilClass::new().to_any_object()),
-            };
-            row.push(rstrings(&c.types));
-            cons.push(row);
-        }
-        let mut out = Array::with_capacity(4);
-        out.push(RString::new_utf8(&d.name));
-        out.push(rstrings(&d.tyvars));
-        out.push(cons);
-        out.push(rstrings(&d.deriving));
-        out
-    },
-    // new_scope -> Integer: a type scope seeded from the global registry
-    fn native_new_scope() -> Integer {
-        let mut scopes = SCOPES.lock().unwrap_or_else(|p| p.into_inner());
-        let seed = scopes[0].clone();
-        scopes.push(seed);
-        Integer::new((scopes.len() - 1) as i64)
-    },
-    // import_scope_in(dst, src, names_or_nil) -> [type names imported]
-    fn native_import_scope(dst: Integer, src: Integer, names: AnyObject) -> AnyObject {
-        let dst = scope_arg(dst);
-        let src = scope_arg(src);
-        let names = names.unwrap_or_else(|_| raise_arg("names must be an Array or nil"));
-        let wanted: Option<Vec<String>> = if names.is_nil() {
-            None
-        } else {
-            let arr = array_arg(&names, "type names").unwrap_or_else(|m| raise_arg(&m));
-            Some(
-                arr.into_iter()
-                    .map(|n| str_arg(&n, "type name").unwrap_or_else(|m| raise_arg(&m)))
-                    .collect(),
-            )
-        };
-        let mut scopes = SCOPES.lock().unwrap_or_else(|p| p.into_inner());
-        if src >= scopes.len() || dst >= scopes.len() {
-            raise_arg("unknown type scope");
-        }
-        let types = scopes[src].user_types();
-        let env = &mut scopes[dst];
-        let mut imported = Vec::new();
-        for (name, cons) in types {
-            if let Some(w) = &wanted {
-                if !w.contains(&name) {
-                    continue;
-                }
-            }
-            if env.has_same_type(&name, &cons) {
-                imported.push(name);
-                continue;
-            }
-            match env.register(&name, &cons) {
-                Ok(_) => imported.push(name),
-                Err(e) => raise_core(e),
-            }
-        }
-        rstrings(&imported).to_any_object()
-    },
-    // register_type(name, [[con_name, arity, fields_or_nil, klass], ...], scope) -> nil
-    fn native_register_type(name: RString, specs: Array, scope: Integer) -> NilClass {
-        let name = name
-            .unwrap_or_else(|_| raise_arg("type name must be a String"))
-            .to_string();
-        let specs = specs.unwrap_or_else(|_| raise_arg("constructor specs must be an Array"));
-        let scope = scope_arg(scope);
-        let outcome = (|| -> Result<Result<(), CoreError>, String> {
-            let mut cons = Vec::new();
-            for spec in specs.into_iter() {
-                let row = array_arg(&spec, "constructor spec")?;
-                if row.length() != 4 {
-                    return Err("constructor spec must be [name, arity, fields, class]".into());
-                }
-                let cname = str_arg(&row.at(0), "constructor name")?;
-                let arity = row
-                    .at(1)
-                    .try_convert_to::<Integer>()
-                    .map_err(|_| "constructor arity must be an Integer".to_string())?
-                    .to_i64();
-                if arity < 0 {
-                    return Err("constructor arity must not be negative".into());
-                }
-                let fields_obj = row.at(2);
-                let fields = if fields_obj.is_nil() {
-                    None
-                } else {
-                    let fa = array_arg(&fields_obj, "field names")?;
-                    let mut names = Vec::new();
-                    for f in fa.into_iter() {
-                        names.push(str_arg(&f, "field name")?);
-                    }
-                    Some(names)
-                };
-                let klass = row.at(3);
-                if klass.is_nil() {
-                    return Err("constructor class must not be nil".into());
-                }
-                cons.push(ConSpec {
-                    name: cname,
-                    arity: arity as usize,
-                    fields,
-                    handle: klass.value().value,
-                });
-            }
-            let mut scopes = SCOPES.lock().unwrap_or_else(|p| p.into_inner());
-            let env = scope_env(&mut scopes, scope)?;
-            let r = env.register(&name, &cons);
-            if r.is_ok() {
-                for c in &cons {
-                    // keep constructor classes alive for as long as the
-                    // process runs: compiled matchers refer to them by VALUE
-                    unsafe {
-                        rutie::rubysys::gc::rb_gc_register_mark_object(Value::from(c.handle))
-                    };
-                }
-            }
-            Ok(r.map(|_| ()))
-        })();
-        match outcome {
-            Err(msg) => raise_arg(&msg),
-            Ok(Err(e)) => raise_core(e),
-            Ok(Ok(())) => NilClass::new(),
-        }
-    },
-    // render_pattern(src) -> canonical Haskell rendering (checks the pattern)
-    fn native_render_pattern(src: RString, scope: Integer) -> RString {
-        let src = src
-            .unwrap_or_else(|_| raise_arg("pattern must be a String"))
-            .to_string();
-        let scope = scope_arg(scope);
-        let result = (|| -> Result<String, CoreError> {
-            let raw = parse_pattern(&src)?;
-            let mut scopes = SCOPES.lock().unwrap_or_else(|p| p.into_inner());
-            let env = scope_env(&mut scopes, scope).unwrap_or_else(|m| raise_arg(&m));
-            let (pats, b) = resolve_clause(env, &[raw])?;
-            Ok(render_pat(env, &pats[0], &b.names))
-        })();
-        match result {
-            Ok(s) => RString::new_utf8(&s),
-            Err(e) => raise_core(e),
-        }
-    },
-    // stack_segment -> Integer (0 = disabled)
-    fn native_stack_segment() -> Integer {
-        Integer::new(STACK_SEGMENT.load(std::sync::atomic::Ordering::Relaxed) as i64)
-    },
-    // stack_segment = n
-    fn native_set_stack_segment(n: Integer) -> Integer {
-        let n = n.map(|i| i.to_i64()).unwrap_or(-1);
-        if n < 0 {
-            raise_arg("stack_segment must be a non-negative Integer (0 disables segmentation)");
-        }
-        STACK_SEGMENT.store(n as usize, std::sync::atomic::Ordering::Relaxed);
-        Integer::new(n)
-    },
-    // max_depth -> Integer (0 = unlimited)
-    fn native_max_depth() -> Integer {
-        Integer::new(MAX_DEPTH.load(std::sync::atomic::Ordering::Relaxed) as i64)
-    },
-    // max_depth = n
-    fn native_set_max_depth(n: Integer) -> Integer {
-        let n = n.map(|i| i.to_i64()).unwrap_or(-1);
-        if n < 0 {
-            raise_arg("max_depth must be a non-negative Integer (0 means unlimited)");
-        }
-        MAX_DEPTH.store(n as usize, std::sync::atomic::Ordering::Relaxed);
-        Integer::new(n)
-    },
-    // parse_haskell(source) -> JSON string of the module AST
-    fn native_parse_haskell(src: RString) -> RString {
-        let src = src
-            .unwrap_or_else(|_| raise_arg("Haskell source must be a String"))
-            .to_string();
-        match crate::core::hs::parse_module(&src) {
-            Ok(m) => RString::new_utf8(&crate::core::hs::json::module(&m)),
-            Err(e) => raise_core(e),
-        }
-    },
-    // constructor_info(name) -> [type_name, arity, fields_or_nil] or nil
-    fn native_constructor_info(name: RString, scope: Integer) -> AnyObject {
-        let name = name
-            .unwrap_or_else(|_| raise_arg("constructor name must be a String"))
-            .to_string();
-        let scope = scope_arg(scope);
-        let mut scopes = SCOPES.lock().unwrap_or_else(|p| p.into_inner());
-        let env = scope_env(&mut scopes, scope).unwrap_or_else(|m| raise_arg(&m));
-        match env.lookup_con(&name) {
-            Some(c) => {
-                let con = env.con(c);
-                let mut row = Array::with_capacity(3);
-                row.push(RString::new_utf8(&env.ty(con.ty).name));
-                row.push(Integer::new(con.arity as i64));
-                match &con.fields {
-                    Some(fs) => row.push(rstrings(fs).to_any_object()),
-                    None => row.push(NilClass::new().to_any_object()),
-                };
-                row.to_any_object()
-            }
-            None => NilClass::new().to_any_object(),
-        }
-    },
-    // constructors(type_name) -> [names] or nil
-    fn native_constructors(name: RString, scope: Integer) -> AnyObject {
-        let name = name
-            .unwrap_or_else(|_| raise_arg("type name must be a String"))
-            .to_string();
-        let scope = scope_arg(scope);
-        let mut scopes = SCOPES.lock().unwrap_or_else(|p| p.into_inner());
-        let env = scope_env(&mut scopes, scope).unwrap_or_else(|m| raise_arg(&m));
-        match env.lookup_type(&name) {
-            Some(t) => {
-                let names: Vec<String> = env
-                    .ty(t)
-                    .cons
-                    .iter()
-                    .map(|c| env.con(*c).name.clone())
-                    .collect();
-                rstrings(&names).to_any_object()
-            }
-            None => NilClass::new().to_any_object(),
-        }
-    }
-);
 
 // ---------------------------------------------------------------------------
 // Matcher construction
@@ -578,35 +260,22 @@ struct Built {
     redundant: Vec<usize>,
 }
 
-enum BuildError {
-    Arg(String),
-    Core(CoreError),
-}
-
-impl From<CoreError> for BuildError {
-    fn from(e: CoreError) -> Self {
-        BuildError::Core(e)
-    }
-}
-
 fn build(
     name: String,
     clauses: &Array,
     guarded: &Array,
     limit: usize,
     scope: usize,
-) -> Result<Built, BuildError> {
+) -> Result<Built, AnyException> {
     let n = clauses.length();
     if n == 0 {
-        return Err(BuildError::Arg("at least one clause is required".into()));
+        return Err(argument_error("at least one clause is required"));
     }
     if guarded.length() != n {
-        return Err(BuildError::Arg(
-            "guard flags must have one entry per clause".into(),
-        ));
+        return Err(argument_error("guard flags must have one entry per clause"));
     }
-    let mut scopes = SCOPES.lock().unwrap_or_else(|p| p.into_inner());
-    let env = scope_env(&mut scopes, scope).map_err(BuildError::Arg)?;
+    let mut scopes = state::scopes();
+    let env = state::scope_env(&mut scopes, scope)?;
     let mut resolved: Vec<(Vec<crate::core::ast::Pat>, bool)> = Vec::with_capacity(n);
     let mut names: Vec<Vec<String>> = Vec::with_capacity(n);
     let mut guard_flags: Vec<bool> = Vec::with_capacity(n);
@@ -722,63 +391,84 @@ fn matcher_of(obj: Value) -> &'static Matcher {
 }
 
 // ---------------------------------------------------------------------------
-// Matcher methods (raw extern "C")
+// Matcher methods (`methods!`, returning `Result`s)
 // ---------------------------------------------------------------------------
 
-/// Matcher.new(name, clauses, guarded_flags, witness_limit)
-unsafe extern "C" fn matcher_new(
-    klass: Value,
-    name: Value,
-    clauses: Value,
-    guarded: Value,
-    limit: Value,
-    scope: Value,
-) -> Value {
-    let outcome = catch_unwind(AssertUnwindSafe(
-        || -> Result<(AnyObject, Vec<String>, bool, Vec<usize>), BuildError> {
-            let name = AnyObject::from(name)
-                .try_convert_to::<RString>()
-                .map(|s| s.to_string())
-                .map_err(|_| BuildError::Arg("name must be a String".into()))?;
-            let clauses = AnyObject::from(clauses)
-                .try_convert_to::<Array>()
-                .map_err(|_| BuildError::Arg("clauses must be an Array".into()))?;
-            let guarded = AnyObject::from(guarded)
-                .try_convert_to::<Array>()
-                .map_err(|_| BuildError::Arg("guard flags must be an Array".into()))?;
-            let limit = AnyObject::from(limit)
-                .try_convert_to::<Integer>()
-                .map(|i| i.to_i64())
-                .unwrap_or(20)
-                .max(1) as usize;
-            let scope = AnyObject::from(scope)
-                .try_convert_to::<Integer>()
-                .map(|i| i.to_i64())
-                .map_err(|_| BuildError::Arg("scope must be an Integer".into()))?;
-            if scope < 0 {
-                return Err(BuildError::Arg("scope must not be negative".into()));
-            }
-            let built = build(name, &clauses, &guarded, limit, scope as usize)?;
-            let obj: AnyObject = Class::from(klass).wrap_data(built.matcher, &*MATCHER_TYPE);
-            Ok((obj, built.missing, built.truncated, built.redundant))
-        },
-    ));
-    match outcome {
-        Err(payload) => raise_panic(payload),
-        Ok(Err(BuildError::Arg(msg))) => raise_arg(&msg),
-        Ok(Err(BuildError::Core(e))) => raise_core(e),
-        Ok(Ok((mut obj, missing, truncated, redundant))) => {
-            obj.instance_variable_set("@missing", rstrings(&missing));
-            obj.instance_variable_set("@missing_truncated", Boolean::new(truncated));
-            let mut red = Array::with_capacity(redundant.len());
-            for r in redundant {
-                red.push(Integer::new(r as i64));
-            }
-            obj.instance_variable_set("@redundant", red);
-            obj.value()
+methods!(
+    RMatcher,
+    rtself,
+    // Matcher.new(name, clauses, guarded_flags, witness_limit, scope):
+    // compiles the clauses and wraps the matcher in an instance of the
+    // receiver (`Matcher` or a subclass such as `Function`), with the
+    // exhaustiveness report in `@missing`, `@missing_truncated` and
+    // `@redundant`.
+    fn matcher_new(
+        name: RString,
+        clauses: Array,
+        guarded: Array,
+        limit: Integer,
+        scope: Integer,
+    ) -> Result<AnyObject, AnyException> {
+        let name = name?.to_string();
+        let clauses = clauses?;
+        let guarded = guarded?;
+        let limit = limit.map(|i| i.to_i64()).unwrap_or(20).max(1) as usize;
+        let scope = scope?.to_i64();
+        if scope < 0 {
+            return Err(argument_error("scope must not be negative"));
         }
+        let built = build(name, &clauses, &guarded, limit, scope as usize)?;
+        let klass = Class::from(rtself.value());
+        let mut obj: AnyObject = klass.wrap_data(built.matcher, &*MATCHER_TYPE);
+        obj.instance_variable_set("@missing", rstrings(&built.missing));
+        obj.instance_variable_set("@missing_truncated", Boolean::new(built.truncated));
+        let mut redundant = Array::with_capacity(built.redundant.len());
+        for r in built.redundant {
+            redundant.push(Integer::new(r as i64));
+        }
+        obj.instance_variable_set("@redundant", redundant);
+        Ok(obj)
+    },
+    // matcher.arity -> number of arguments
+    fn matcher_arity() -> Integer {
+        Integer::new(matcher_of(rtself.value()).arity as i64)
+    },
+    // matcher.name -> the function's name
+    fn matcher_name() -> RString {
+        RString::new_utf8(&matcher_of(rtself.value()).name)
+    },
+    // matcher.names -> variables bound by each clause, in order
+    fn matcher_names() -> Array {
+        let m = matcher_of(rtself.value());
+        let mut out = Array::with_capacity(m.names.len());
+        for ns in &m.names {
+            out.push(rstrings(ns));
+        }
+        out
+    },
+    // matcher.guarded -> whether each clause has a guard
+    fn matcher_guarded() -> Array {
+        let m = matcher_of(rtself.value());
+        let mut out = Array::with_capacity(m.guarded.len());
+        for g in &m.guarded {
+            out.push(Boolean::new(*g));
+        }
+        out
+    },
+    // matcher.slots -> value slots of the decision tree
+    fn matcher_slots() -> Integer {
+        Integer::new(matcher_of(rtself.value()).n_slots as i64)
+    },
+    // matcher.tree -> human-readable dump of the decision tree
+    fn matcher_tree() -> RString {
+        let m = matcher_of(rtself.value());
+        RString::new_utf8(&runtime::dump(&m.env, &m.tree, &m.names, 0))
     }
-}
+);
+
+// ---------------------------------------------------------------------------
+// Matcher hot-path methods (raw extern "C")
+// ---------------------------------------------------------------------------
 
 /// Outcome of the pure-Rust part of a call: the body to invoke and where its
 /// arguments are.
@@ -979,35 +669,14 @@ unsafe extern "C" fn matcher_prepare(argc: c_int, argv: *const Value, rtself: Va
             };
             array::rb_ary_push(out, p.body);
             // Count this level now; the Ruby caller pops it after the body.
-            let depth = native_depth_push(rtself);
-            array::rb_ary_push(out, depth);
+            let depth = match state::depth_push() {
+                Ok(depth) => depth,
+                Err(e) => raise(e),
+            };
+            array::rb_ary_push(out, Integer::new(depth as i64).value());
             out
         }
     }
-}
-
-/// Native.depth_push -> the new nesting depth (raises StackOverflowError past
-/// max_depth); Native.depth_pop undoes it.  Used by deep-mode functions,
-/// whose body invocation happens in Ruby.
-unsafe extern "C" fn native_depth_push(_rtself: Value) -> Value {
-    let depth = DEPTH.with(|d| d.get());
-    let max = MAX_DEPTH.load(std::sync::atomic::Ordering::Relaxed);
-    if max > 0 && depth >= max {
-        VM::raise_ex(exception(
-            "StackOverflowError",
-            &format!(
-                "recursion deeper than HaskellMatch.max_depth ({}); use tail calls, defer, or raise the limit",
-                max
-            ),
-        ));
-    }
-    DEPTH.with(|d| d.set(depth + 1));
-    Integer::new((depth + 1) as i64).value()
-}
-
-unsafe extern "C" fn native_depth_pop(_rtself: Value) -> Value {
-    DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
-    Value::from(rutie::rubysys::value::RubySpecialConsts::Nil as usize)
 }
 
 /// matcher.select(*args) -> [clause_index, [values]] or nil (guards from
@@ -1104,41 +773,6 @@ unsafe extern "C" fn matcher_run(
     }
 }
 
-unsafe extern "C" fn matcher_arity(rtself: Value) -> Value {
-    Integer::new(matcher_of(rtself).arity as i64).value()
-}
-
-unsafe extern "C" fn matcher_name(rtself: Value) -> Value {
-    RString::new_utf8(&matcher_of(rtself).name).value()
-}
-
-unsafe extern "C" fn matcher_names(rtself: Value) -> Value {
-    let m = matcher_of(rtself);
-    let mut out = Array::with_capacity(m.names.len());
-    for ns in &m.names {
-        out.push(rstrings(ns));
-    }
-    out.value()
-}
-
-unsafe extern "C" fn matcher_guarded(rtself: Value) -> Value {
-    let m = matcher_of(rtself);
-    let mut out = Array::with_capacity(m.guarded.len());
-    for g in &m.guarded {
-        out.push(Boolean::new(*g));
-    }
-    out.value()
-}
-
-unsafe extern "C" fn matcher_slots(rtself: Value) -> Value {
-    Integer::new(matcher_of(rtself).n_slots as i64).value()
-}
-
-unsafe extern "C" fn matcher_tree(rtself: Value) -> Value {
-    let m = matcher_of(rtself);
-    RString::new_utf8(&runtime::dump(&m.env, &m.tree, &m.names, 0)).value()
-}
-
 unsafe fn def_method(klass: Value, name: &str, f: CallbackPtr, argc: c_int) {
     let cname = CString::new(name).unwrap();
     rclass::rb_define_method(klass, cname.as_ptr(), f, argc);
@@ -1148,48 +782,28 @@ pub fn init() {
     // Nothing here keeps per-Ractor state: the type registry is behind a
     // mutex and matchers are immutable once built.
     unsafe { VM::ext_ractor_safe(true) };
-    let mut hm = Module::from_existing("HaskellMatch");
-    let mut native = hm.define_nested_module("Native");
-    unsafe {
-        let n = native.value();
-        let push = CString::new("depth_push").unwrap();
-        let pop = CString::new("depth_pop").unwrap();
-        rclass::rb_define_singleton_method(n, push.as_ptr(), native_depth_push as CallbackPtr, 0);
-        rclass::rb_define_singleton_method(n, pop.as_ptr(), native_depth_pop as CallbackPtr, 0);
-    }
-    native.define(|m| {
-        m.def_self("parse_data", native_parse_data);
-        m.def_self("new_scope", native_new_scope);
-        m.def_self("import_scope_in", native_import_scope);
-        m.def_self("register_type_in", native_register_type);
-        m.def_self("render_pattern_in", native_render_pattern);
-        m.def_self("constructors_in", native_constructors);
-        m.def_self("parse_haskell", native_parse_haskell);
-        m.def_self("constructor_info_in", native_constructor_info);
-        m.def_self("stack_segment", native_stack_segment);
-        m.def_self("stack_segment=", native_set_stack_segment);
-        m.def_self("max_depth", native_max_depth);
-        m.def_self("max_depth=", native_set_max_depth);
-    });
+    let mut native = native::functions::define_ruby();
+    HmError::define_ruby();
     let object = Class::from_existing("Object");
     let mut matcher = native.define_nested_class("Matcher", Some(&object));
     // Instances are only ever created through `new` with wrapped data.
     matcher.undef_alloc_func();
+    matcher.define(|k| {
+        k.def_self("new", matcher_new);
+        k.def("arity", matcher_arity);
+        k.def("name", matcher_name);
+        k.def("names", matcher_names);
+        k.def("guarded", matcher_guarded);
+        k.def("slots", matcher_slots);
+        k.def("tree", matcher_tree);
+    });
     unsafe {
         let k = matcher.value();
-        let new_name = CString::new("new").unwrap();
-        rclass::rb_define_singleton_method(k, new_name.as_ptr(), matcher_new as CallbackPtr, 5);
         def_method(k, "call", matcher_call as CallbackPtr, -1);
         def_method(k, "prepare", matcher_prepare as CallbackPtr, -1);
         def_method(k, "select", matcher_select as CallbackPtr, -1);
         def_method(k, "select_with", matcher_select_with as CallbackPtr, 2);
         def_method(k, "run", matcher_run as CallbackPtr, 3);
-        def_method(k, "arity", matcher_arity as CallbackPtr, 0);
-        def_method(k, "name", matcher_name as CallbackPtr, 0);
-        def_method(k, "names", matcher_names as CallbackPtr, 0);
-        def_method(k, "guarded", matcher_guarded as CallbackPtr, 0);
-        def_method(k, "slots", matcher_slots as CallbackPtr, 0);
-        def_method(k, "tree", matcher_tree as CallbackPtr, 0);
     }
     ids();
 }

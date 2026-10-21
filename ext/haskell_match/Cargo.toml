@@ -11,9 +11,9 @@ name = "haskell_match"
 crate-type = ["cdylib"]
 
 [dependencies]
-# Rutie 0.13 targets Ruby 3.x; Rutie 0.14 targets Ruby 4.0.
-rutie = "0.13"
-lazy_static = "1.4"
+# Rutie 0.13 targets Ruby 3.x; Rutie 0.14 targets Ruby 4.0.  The `derive`
+# feature gives the `#[rubymodule]`, `#[rubyerror]` and related attributes.
+rutie = { version = "0.13.3", features = ["derive"] }
 
 [profile.release]
 opt-level = 3
