@@ -3,7 +3,9 @@
 require_relative "test_helper"
 
 # Direct exercise of the native boundary: bad arguments must raise, never
-# crash.
+# crash.  The module functions are declared with Rutie's `#[rubymodule]`, so
+# an argument of the wrong type is a TypeError, an Integer out of range a
+# RangeError, and a well-typed argument with a bad value an ArgumentError.
 class NativeTest < Minitest::Test
   include TestHelpers
 
@@ -15,7 +17,8 @@ class NativeTest < Minitest::Test
     assert_equal [["P", 2, %w[a b], %w[Int Int]]], N.parse_data("P = P { a :: Int, b :: Int }")[2]
     assert_equal %w[Eq Ord], N.parse_data("P = P Int deriving (Eq, Ord)")[3]
     assert_raises(HaskellMatch::DataDeclarationError) { N.parse_data("= X") }
-    assert_raises(ArgumentError) { N.parse_data(5) }
+    assert_raises(TypeError) { N.parse_data(5) }
+    assert_raises(ArgumentError) { N.parse_data }
   end
 
   def test_constructors
@@ -25,21 +28,39 @@ class NativeTest < Minitest::Test
   end
 
   def test_register_type_argument_errors
-    assert_raises(ArgumentError) { N.register_type(5, []) }
-    assert_raises(ArgumentError) { N.register_type("T", 5) }
+    assert_raises(TypeError) { N.register_type(5, []) }
+    assert_raises(TypeError) { N.register_type("T", 5) }
+    assert_raises(TypeError) { N.register_type("T", [5]) }
     assert_raises(ArgumentError) { N.register_type("T", [["A", 0, nil]]) }
-    assert_raises(ArgumentError) { N.register_type("T", [["A", "x", nil, Object]]) }
-    assert_raises(ArgumentError) { N.register_type("T", [["A", -1, nil, Object]]) }
+    assert_raises(TypeError) { N.register_type("T", [["A", "x", nil, Object]]) }
+    assert_raises(RangeError) { N.register_type("T", [["A", -1, nil, Object]]) }
     assert_raises(ArgumentError) { N.register_type("T", [["A", 0, nil, nil]]) }
-    assert_raises(ArgumentError) { N.register_type("T", [["A", 1, "fields", Object]]) }
+    assert_raises(TypeError) { N.register_type("T", [["A", 1, "fields", Object]]) }
     assert_raises(HaskellMatch::DataDeclarationError) { N.register_type("T", []) }
     assert_raises(HaskellMatch::DataDeclarationError) { N.register_type("T", [["A", 1, ["a", "b"], Object]]) }
     refute N.constructors("T")
   end
 
+  def test_scope_argument_errors
+    assert_raises(RangeError) { N.constructors("Maybe", -1) }
+    assert_raises(ArgumentError) { N.constructors("Maybe", 999_999) }
+    assert_raises(ArgumentError) { N.import_scope(999_999, 0) }
+    assert_raises(TypeError) { N.import_scope(0, 0, 5) }
+    assert_raises(TypeError) { N.max_depth = :many }
+    assert_raises(ArgumentError) { N.max_depth = -1 }
+  end
+
+  def test_rbs_declaration
+    rbs = N.rbs
+    assert_includes rbs, "module HaskellMatch"
+    assert_includes rbs, "def self.parse_data: (String decl)"
+    assert_includes rbs, "def self.max_depth=: (Integer levels) -> Integer"
+  end
+
   def test_matcher_argument_errors
-    assert_raises(ArgumentError) { N::Matcher.new(1, [["x"]], [false], 20, 0) }
-    assert_raises(ArgumentError) { N::Matcher.new("f", "x", [false], 20, 0) }
+    assert_raises(TypeError) { N::Matcher.new(1, [["x"]], [false], 20, 0) }
+    assert_raises(TypeError) { N::Matcher.new("f", "x", [false], 20, 0) }
+    assert_raises(ArgumentError) { N::Matcher.new("f", [["x"]], [false], 20, -1) }
     assert_raises(ArgumentError) { N::Matcher.new("f", [], [], 20, 0) }
     assert_raises(ArgumentError) { N::Matcher.new("f", [["x"]], [], 20, 0) }
     assert_raises(HaskellMatch::PatternSyntaxError) { N::Matcher.new("f", ["x"], [false], 20, 0) }

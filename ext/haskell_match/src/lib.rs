@@ -6,8 +6,6 @@
 
 #[macro_use]
 extern crate rutie;
-#[macro_use]
-extern crate lazy_static;
 
 pub mod core;
 pub mod ruby;

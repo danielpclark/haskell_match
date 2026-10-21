@@ -1458,8 +1458,11 @@ Array per `(x:xs)` tail that is bound.
   of {0, 1}`).
 * `core::tree` — compilation to a decision tree over numbered value slots.
 * `ruby::runtime` — evaluation over Ruby values, including Strings and lazy
-  lists viewed as lists; `ruby` — the `Native` module, the trampoline that
-  handles `tail`/`defer` markers and the Fiber-segmented recursion.
+  lists viewed as lists; `ruby::native` — the `Native` module functions,
+  declared with Rutie's `#[rubymodule]`; `ruby::error` — the exceptions the
+  extension raises, declared with `#[rubyerror]`; `ruby` — the `Matcher`
+  class, the trampoline that handles `tail`/`defer` markers and the
+  Fiber-segmented recursion.
 * `lib/haskell_match/pattern_ast.rb` — the in-place pattern syntax, rendered
   to Haskell text; `lazy_list.rb` — memoised lazy lists.
 
