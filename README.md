@@ -248,7 +248,7 @@ end                                  # => "just 3"
 
 # a pattern on its own, usable in case/when
 head = HaskellMatch.pattern { Just([x, *_]) }
-head.match(Just[[9, 8]])             # => {:x=>9}
+head.match(Just[[9, 8]])             # => {x: 9}
 head === Just[[]]                    # => false
 
 # methods defined by clauses, with access to self
@@ -282,7 +282,7 @@ end
 f.([1, 2, 3])                        # => [2, 3]
 
 g = HaskellMatch.fn(:g) { on([x, *xs]) { |x:, xs:| { x: x, xs: xs } }; on([]) { {} } }
-g.([1, 2])                           # => {:x=>1, :xs=>[2]}
+g.([1, 2])                           # => {x: 1, xs: [2]}
 ```
 
 ## Recursion without limits, and laziness

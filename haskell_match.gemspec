@@ -30,6 +30,10 @@ Gem::Specification.new do |spec|
   spec.require_paths = ["lib"]
   spec.extensions = ["ext/haskell_match/extconf.rb"]
 
+  # The native library is loaded through Fiddle, which Ruby 3.5 no longer
+  # ships as a default gem.
+  spec.add_dependency "fiddle", "~> 1.1"
+
   spec.metadata["source_code_uri"] = spec.homepage
   spec.metadata["rubygems_mfa_required"] = "true"
 
